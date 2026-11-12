@@ -34,8 +34,16 @@ systemctl --user restart filter-chain
 
 `60-macbook-speakers.conf` in this folder is the same output, ready to copy.
 
-Then in Settings → Sound:
-- card profile **Analog Surround 4.0 Output + Analog Stereo Input**;
+Pin the card to the 4-channel profile, otherwise WirePlumber can come back in plain
+stereo after a reboot and the crossover silently stops working:
+
+```bash
+mkdir -p ~/.config/wireplumber/wireplumber.conf.d
+cp 60-macbook-speakers-profile.conf ~/.config/wireplumber/wireplumber.conf.d/
+systemctl --user restart wireplumber filter-chain
+```
+
+(or pick **Analog Surround 4.0 Output + Analog Stereo Input** in Settings → Sound). Then:
 - set "Built-in Audio Analog Surround 4.0" to 100 % and control volume through
   **"MacBook Speakers (Apple DSP)"**.
 
