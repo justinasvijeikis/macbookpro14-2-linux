@@ -1,0 +1,71 @@
+From 71f4d12f488bb1b86333108c4acdb6592ed89fce Mon Sep 17 00:00:00 2001
+From: justinasvijeikis <80092258+justinasvijeikis@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:13:08 +0200
+Subject: [PATCH 3/4] debian: keep NetworkManager off the private T1 NCM link
+
+Without NM_UNMANAGED, NetworkManager auto-activates a wired profile on the
+T1 NCM interface, retries DHCP every 45 s and GNOME reports activation
+failures. Install the network half of upstream 90-t1bridge-xart.rules
+(without the Touch ID xART service).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ debian/90-t1bridge-ncm-unmanaged.rules | 6 ++++++
+ debian/README.md                       | 1 +
+ debian/install-touchbar.sh             | 4 ++++
+ debian/uninstall-touchbar.sh           | 1 +
+ 4 files changed, 12 insertions(+)
+ create mode 100644 debian/90-t1bridge-ncm-unmanaged.rules
+
+diff --git a/debian/90-t1bridge-ncm-unmanaged.rules b/debian/90-t1bridge-ncm-unmanaged.rules
+new file mode 100644
+index 0000000..dd1c431
+--- /dev/null
++++ b/debian/90-t1bridge-ncm-unmanaged.rules
+@@ -0,0 +1,6 @@
++# Upstream 90-t1bridge-xart.rules be Touch ID dalies (t1-xart-storage):
++# privačios T1 NCM sąsajos neliečia NetworkManager / kiti tinklo valdytojai.
++# Be šito NM kas ~45 s bando DHCP ir GNOME rodo "Activation of network connection failed".
++ACTION=="add", SUBSYSTEM=="net", ENV{ID_VENDOR_ID}=="05ac", \
++  ENV{ID_MODEL_ID}=="8600", ENV{ID_USB_INTERFACE_NUM}=="04", \
++  ENV{ID_NET_MANAGED_BY}="org.t1bridge", ENV{NM_UNMANAGED}="1"
+diff --git a/debian/README.md b/debian/README.md
+index 9b4eb04..d013ade 100644
+--- a/debian/README.md
++++ b/debian/README.md
+@@ -18,4 +18,5 @@ Kas čia pakeista, palyginti su upstream v0.1.12:
+ - savas PNG dekoderis (`crates/t1-touchbar/src/png.rs`), be naujų priklausomybių;
+ - ROOT: `TapKeys` dabar akordas, klavišų allowlist'as 101 klavišas (`wire::KeyCode::ALLOWED` = C `key_codes`);
+ - `t1bridge-desktop-provider` — garso mygtukai (wpctl) ir MPRIS play/next (gdbus);
++- T1 NCM sąsaja paslėpta nuo NetworkManager (kitaip kas 45 s „Activation of network connection failed“);
+ - usbmuxd udev pataisa: Debian'o taisyklė išjungia T1 (`bConfigurationValue=0`).
+diff --git a/debian/install-touchbar.sh b/debian/install-touchbar.sh
+index d7a2b35..18a6669 100644
+--- a/debian/install-touchbar.sh
++++ b/debian/install-touchbar.sh
+@@ -70,6 +70,10 @@ if [ -f /usr/lib/udev/rules.d/39-usbmuxd.rules ]; then
+ 	udevadm control --reload
+ fi
+ 
++echo "== 5b. T1 privatus tinklas (apple_t1_ncm) — NetworkManager neturi jo liesti"
++install -Dm644 "$SRC/debian/90-t1bridge-ncm-unmanaged.rules" /etc/udev/rules.d/90-t1bridge-ncm-unmanaged.rules
++udevadm control --reload
++
+ echo "== 6. Vartotojo konfigas (jei dar nėra)"
+ USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+ CONF_DIR="$USER_HOME/.config/t1bridge"
+diff --git a/debian/uninstall-touchbar.sh b/debian/uninstall-touchbar.sh
+index accf596..5d42e71 100644
+--- a/debian/uninstall-touchbar.sh
++++ b/debian/uninstall-touchbar.sh
+@@ -11,6 +11,7 @@ rm -f /etc/systemd/system/t1-touchbar-hw.{service,socket} /etc/systemd/user/t1-t
+       /etc/tmpfiles.d/t1bridge.conf /etc/modules-load.d/t1bridge.conf /etc/modprobe.d/t1bridge.conf
+ rm -rf /usr/lib/t1bridge
+ rm -rf /etc/systemd/user/t1-touchbar.service.d
++rm -f /etc/udev/rules.d/90-t1bridge-ncm-unmanaged.rules
+ rm -f /etc/udev/rules.d/39-usbmuxd.rules  # grąžina Debian'o usbmuxd taisyklę
+ sed -i '/^t1_cfgsel$/d' /etc/initramfs-tools/modules
+ dkms remove -m t1bridge-dkms -v "$VER" --all
+-- 
+2.47.3
+

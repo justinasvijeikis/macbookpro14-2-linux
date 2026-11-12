@@ -1,0 +1,3353 @@
+From 28d5e0d22491b1cc73283b9189c0716534b87754 Mon Sep 17 00:00:00 2001
+From: justinasvijeikis <80092258+justinasvijeikis@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:09:51 +0200
+Subject: [PATCH 2/4] Debian: macOS Escape, GNOME theme, user themes and Fn
+ chords
+
+- Escape is 64 pt like macOS; F1-F12 share the rest.
+- Follow GNOME accent and light/dark style via gsettings monitor.
+- touchbar.conf: built-in default/penguin themes, user themes with PNG
+  background, watermark, mascot and Fn icons; hot reload.
+- Dependency-free PNG decoder for theme art.
+- TapKeys emits one chord (pressed in order, released in reverse) over a
+  fixed 101-key allowlist shared by wire.rs and the native uinput table.
+- Fn keys can run a key chord or a command.
+- debian/: desktop provider (wpctl, MPRIS), installer incl. usbmuxd udev
+  fix and user config, README.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/t1-platform/src/ffi.rs                 |  14 +
+ crates/t1-platform/src/touchbar_io.rs         |  15 +
+ crates/t1-touchbar-hw/c/t1_touchbar_uinput.c  | 156 +++--
+ crates/t1-touchbar-hw/c/t1_touchbar_uinput.h  |  14 +-
+ crates/t1-touchbar-hw/c/test_t1_touchbar_io.c |  50 ++
+ crates/t1-touchbar-hw/src/service.rs          |  41 +-
+ crates/t1-touchbar-hw/src/wire.rs             | 203 +++++--
+ crates/t1-touchbar/src/builtin_renderer.rs    | 113 +++-
+ crates/t1-touchbar/src/config.rs              | 533 ++++++++++++++++++
+ crates/t1-touchbar/src/decor.rs               | 218 +++++++
+ crates/t1-touchbar/src/framebuffer.rs         |  50 ++
+ crates/t1-touchbar/src/lib.rs                 |   5 +
+ crates/t1-touchbar/src/png.rs                 | 531 +++++++++++++++++
+ crates/t1-touchbar/src/stock_art.rs           |   8 +
+ crates/t1-touchbar/src/stock_slice.rs         | 211 +++++--
+ crates/t1-touchbar/src/theme.rs               | 242 ++++++++
+ crates/t1-touchbar/src/tux.rs                 | 171 ++++++
+ debian/README.md                              |  21 +
+ debian/install-touchbar.sh                    |  83 +++
+ debian/t1bridge-desktop-provider              |  46 ++
+ debian/themes-README.txt                      |  17 +
+ debian/touchbar.conf.example                  |  19 +
+ debian/uninstall-touchbar.sh                  |  21 +
+ 23 files changed, 2626 insertions(+), 156 deletions(-)
+ create mode 100644 crates/t1-touchbar/src/config.rs
+ create mode 100644 crates/t1-touchbar/src/decor.rs
+ create mode 100644 crates/t1-touchbar/src/png.rs
+ create mode 100644 crates/t1-touchbar/src/theme.rs
+ create mode 100644 crates/t1-touchbar/src/tux.rs
+ create mode 100644 debian/README.md
+ create mode 100644 debian/install-touchbar.sh
+ create mode 100755 debian/t1bridge-desktop-provider
+ create mode 100644 debian/themes-README.txt
+ create mode 100644 debian/touchbar.conf.example
+ create mode 100644 debian/uninstall-touchbar.sh
+
+diff --git a/crates/t1-platform/src/ffi.rs b/crates/t1-platform/src/ffi.rs
+index c1a679a..00d873c 100644
+--- a/crates/t1-platform/src/ffi.rs
++++ b/crates/t1-platform/src/ffi.rs
+@@ -432,6 +432,12 @@ unsafe extern "C" {
+     #[cfg(feature = "touchbar-io")]
+     fn t1_touchbar_uinput_tap(device: *mut RawTouchBarKeyboard, key: c_int) -> c_int;
+     #[cfg(feature = "touchbar-io")]
++    fn t1_touchbar_uinput_chord(
++        device: *mut RawTouchBarKeyboard,
++        codes: *const u16,
++        count: usize,
++    ) -> c_int;
++    #[cfg(feature = "touchbar-io")]
+     fn t1_touchbar_uinput_release_all(device: *mut RawTouchBarKeyboard) -> c_int;
+     #[cfg(feature = "touchbar-io")]
+     fn t1_touchbar_uinput_close(device: *mut RawTouchBarKeyboard) -> c_int;
+@@ -1808,6 +1814,14 @@ pub(super) fn tap_touchbar_key(device: *mut RawTouchBarKeyboard, key: c_int) ->
+     unsafe { t1_touchbar_uinput_tap(device, key) }
+ }
+ 
++#[cfg(feature = "touchbar-io")]
++pub(super) fn chord_touchbar_keys(device: *mut RawTouchBarKeyboard, codes: &[u16]) -> c_int {
++    // SAFETY: the safe wrapper supplies its exclusively owned live handle; the
++    // slice stays borrowed for the call and the native side validates every
++    // code against its fixed allowlist and the count against its maximum.
++    unsafe { t1_touchbar_uinput_chord(device, codes.as_ptr(), codes.len()) }
++}
++
+ #[cfg(feature = "touchbar-io")]
+ pub(super) fn release_touchbar_keys(device: *mut RawTouchBarKeyboard) -> c_int {
+     // SAFETY: the safe wrapper supplies its exclusively owned live handle.
+diff --git a/crates/t1-platform/src/touchbar_io.rs b/crates/t1-platform/src/touchbar_io.rs
+index 1f1c65d..ef66d2c 100644
+--- a/crates/t1-platform/src/touchbar_io.rs
++++ b/crates/t1-platform/src/touchbar_io.rs
+@@ -385,6 +385,21 @@ impl TouchBarKeyboard {
+         }
+     }
+ 
++    /// Presses up to four distinct allowlisted Linux key codes together, then
++    /// releases them in reverse order.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`TouchBarIoError`] for an unknown, duplicate, held, or
++    /// excessive key set, or when the event sequence cannot be written.
++    pub fn chord(&mut self, codes: &[u16]) -> Result<(), TouchBarIoError> {
++        let native = self.native.ok_or(TouchBarIoError::Closed)?;
++        match NativeStatus::from_status(ffi::chord_touchbar_keys(native.as_ptr(), codes))? {
++            NativeStatus::Complete => Ok(()),
++            NativeStatus::Idle | NativeStatus::Resync => Err(TouchBarIoError::Unknown),
++        }
++    }
++
+     /// Retries release of every key whose prior release was not confirmed.
+     ///
+     /// # Errors
+diff --git a/crates/t1-touchbar-hw/c/t1_touchbar_uinput.c b/crates/t1-touchbar-hw/c/t1_touchbar_uinput.c
+index 9f2d2d3..a96a9b1 100644
+--- a/crates/t1-touchbar-hw/c/t1_touchbar_uinput.c
++++ b/crates/t1-touchbar-hw/c/t1_touchbar_uinput.c
+@@ -13,30 +13,43 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
+-#define KEY_COUNT 13U
++/*
++ * Escape and F1-F12 come first and are indexed by enum t1_touchbar_key.
++ * The rest are the user-configurable chord keys: modifiers, letters, digits,
++ * navigation, punctuation, F13-F24 and media keys. No key outside this table
++ * can be emitted; it must match KeyCode::ALLOWED in wire.rs.
++ */
++static const unsigned short key_codes[] = {
++	KEY_ESC, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,
++	KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
++	KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT,
++	KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTMETA, KEY_RIGHTMETA,
++	KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I,
++	KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R,
++	KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z,
++	KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
++	KEY_TAB, KEY_ENTER, KEY_SPACE, KEY_BACKSPACE, KEY_DELETE, KEY_INSERT,
++	KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN,
++	KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_SYSRQ,
++	KEY_MINUS, KEY_EQUAL, KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_SEMICOLON,
++	KEY_APOSTROPHE, KEY_GRAVE, KEY_BACKSLASH, KEY_COMMA, KEY_DOT, KEY_SLASH,
++	KEY_F13, KEY_F14, KEY_F15, KEY_F16, KEY_F17, KEY_F18,
++	KEY_F19, KEY_F20, KEY_F21, KEY_F22, KEY_F23, KEY_F24,
++	KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP, KEY_PLAYPAUSE,
++	KEY_NEXTSONG, KEY_PREVIOUSSONG,
++};
++
++#define KEY_COUNT ((unsigned int)(sizeof(key_codes) / sizeof(key_codes[0])))
++#define HELD_WORDS 2U
+ 
+ struct t1_touchbar_uinput {
+ 	int descriptor;
+-	uint16_t held;
++	uint64_t held[HELD_WORDS];
+ 	int created;
+ };
+ 
+-static const unsigned int key_codes[KEY_COUNT] = {
+-	KEY_ESC,
+-	KEY_F1,
+-	KEY_F2,
+-	KEY_F3,
+-	KEY_F4,
+-	KEY_F5,
+-	KEY_F6,
+-	KEY_F7,
+-	KEY_F8,
+-	KEY_F9,
+-	KEY_F10,
+-	KEY_F11,
+-	KEY_F12,
+-};
+-
++_Static_assert(sizeof(key_codes) / sizeof(key_codes[0]) <= 64U * HELD_WORDS,
++	       "held bitmap too small");
+ _Static_assert(T1_TOUCHBAR_KEY_ESCAPE == 0,
+ 	       "Touch Bar key ABI changed");
+ _Static_assert(T1_TOUCHBAR_KEY_F12 == 12,
+@@ -59,20 +72,48 @@ static int write_all(int descriptor, const void *data, size_t size)
+ 	return 0;
+ }
+ 
++static int is_held(const struct t1_touchbar_uinput *device, unsigned int index)
++{
++	return (device->held[index / 64U] >> (index % 64U)) & 1U;
++}
++
++static void set_held(struct t1_touchbar_uinput *device, unsigned int index,
++		     int held)
++{
++	uint64_t bit = UINT64_C(1) << (index % 64U);
++
++	if (held)
++		device->held[index / 64U] |= bit;
++	else
++		device->held[index / 64U] &= ~bit;
++}
++
++static int code_index(unsigned int code, unsigned int *index)
++{
++	unsigned int candidate;
++
++	for (candidate = 0; candidate < KEY_COUNT; ++candidate) {
++		if (key_codes[candidate] == code) {
++			*index = candidate;
++			return 1;
++		}
++	}
++	return 0;
++}
++
+ static int valid_key(enum t1_touchbar_key key)
+ {
+-	return key >= T1_TOUCHBAR_KEY_ESCAPE &&
+-	       (unsigned int)key < KEY_COUNT;
++	return key >= T1_TOUCHBAR_KEY_ESCAPE && key <= T1_TOUCHBAR_KEY_F12;
+ }
+ 
+-static int emit(struct t1_touchbar_uinput *device,
+-		enum t1_touchbar_key key, int pressed)
++static int emit(struct t1_touchbar_uinput *device, unsigned int key,
++		int pressed)
+ {
+ 	struct input_event events[2];
+ 
+ 	memset(events, 0, sizeof(events));
+ 	events[0].type = EV_KEY;
+-	events[0].code = (uint16_t)key_codes[(unsigned int)key];
++	events[0].code = key_codes[key];
+ 	events[0].value = pressed;
+ 	events[1].type = EV_SYN;
+ 	events[1].code = SYN_REPORT;
+@@ -130,23 +171,52 @@ configure_failure:
+ enum t1_touchbar_io_status t1_touchbar_uinput_tap(
+ 	struct t1_touchbar_uinput *device, enum t1_touchbar_key key)
+ {
+-	uint16_t mask;
+-
+ 	if (device == NULL || device->descriptor < 0 || !valid_key(key))
+ 		return T1_TOUCHBAR_IO_ERROR_ARGUMENT;
+-	mask = (uint16_t)(UINT16_C(1) << (unsigned int)key);
+-	if ((device->held & mask) != 0)
+-		return T1_TOUCHBAR_IO_ERROR_PROTOCOL;
+-	device->held |= mask;
+-	if (emit(device, key, 1) != 0) {
+-		if (emit(device, key, 0) == 0)
+-			device->held &= (uint16_t)~mask;
+-		return T1_TOUCHBAR_IO_ERROR_IO;
++	return t1_touchbar_uinput_chord(device, &key_codes[(unsigned int)key], 1U);
++}
++
++enum t1_touchbar_io_status t1_touchbar_uinput_chord(
++	struct t1_touchbar_uinput *device, const unsigned short *codes,
++	size_t count)
++{
++	unsigned int indexes[T1_TOUCHBAR_CHORD_MAX];
++	size_t position;
++	size_t pressed = 0;
++	int failed = 0;
++
++	if (device == NULL || device->descriptor < 0 || codes == NULL ||
++	    count == 0U || count > T1_TOUCHBAR_CHORD_MAX)
++		return T1_TOUCHBAR_IO_ERROR_ARGUMENT;
++	for (position = 0; position < count; ++position) {
++		size_t earlier;
++
++		if (!code_index(codes[position], &indexes[position]))
++			return T1_TOUCHBAR_IO_ERROR_ARGUMENT;
++		for (earlier = 0; earlier < position; ++earlier) {
++			if (indexes[earlier] == indexes[position])
++				return T1_TOUCHBAR_IO_ERROR_ARGUMENT;
++		}
++		if (is_held(device, indexes[position]))
++			return T1_TOUCHBAR_IO_ERROR_PROTOCOL;
+ 	}
+-	if (emit(device, key, 0) != 0)
+-		return T1_TOUCHBAR_IO_ERROR_IO;
+-	device->held &= (uint16_t)~mask;
+-	return T1_TOUCHBAR_IO_OK;
++	for (position = 0; position < count; ++position) {
++		set_held(device, indexes[position], 1);
++		if (emit(device, indexes[position], 1) != 0) {
++			failed = 1;
++			pressed = position + 1U;
++			break;
++		}
++		pressed = position + 1U;
++	}
++	while (pressed > 0U) {
++		--pressed;
++		if (emit(device, indexes[pressed], 0) == 0)
++			set_held(device, indexes[pressed], 0);
++		else
++			failed = 1;
++	}
++	return failed ? T1_TOUCHBAR_IO_ERROR_IO : T1_TOUCHBAR_IO_OK;
+ }
+ 
+ enum t1_touchbar_io_status t1_touchbar_uinput_release_all(
+@@ -158,15 +228,13 @@ enum t1_touchbar_io_status t1_touchbar_uinput_release_all(
+ 	if (device == NULL || device->descriptor < 0)
+ 		return T1_TOUCHBAR_IO_ERROR_ARGUMENT;
+ 	for (index = 0; index < KEY_COUNT; ++index) {
+-		uint16_t mask = (uint16_t)(UINT16_C(1) << index);
+-
+-		if ((device->held & mask) == 0)
++		if (!is_held(device, index))
+ 			continue;
+-		if (emit(device, (enum t1_touchbar_key)index, 0) != 0) {
++		if (emit(device, index, 0) != 0) {
+ 			result = T1_TOUCHBAR_IO_ERROR_IO;
+ 			continue;
+ 		}
+-		device->held &= (uint16_t)~mask;
++		set_held(device, index, 0);
+ 	}
+ 	return result;
+ }
+@@ -205,13 +273,13 @@ struct t1_touchbar_uinput *t1_touchbar_uinput_test_device(int descriptor)
+ unsigned int t1_touchbar_uinput_test_held(
+ 	const struct t1_touchbar_uinput *device)
+ {
+-	return device == NULL ? UINT32_MAX : device->held;
++	return device == NULL ? UINT32_MAX : (unsigned int)device->held[0];
+ }
+ 
+ void t1_touchbar_uinput_test_mark_held(
+ 	struct t1_touchbar_uinput *device, enum t1_touchbar_key key)
+ {
+ 	if (device != NULL && valid_key(key))
+-		device->held |= (uint16_t)(UINT16_C(1) << (unsigned int)key);
++		set_held(device, (unsigned int)key, 1);
+ }
+ #endif
+diff --git a/crates/t1-touchbar-hw/c/t1_touchbar_uinput.h b/crates/t1-touchbar-hw/c/t1_touchbar_uinput.h
+index cc37d1e..28bc151 100644
+--- a/crates/t1-touchbar-hw/c/t1_touchbar_uinput.h
++++ b/crates/t1-touchbar-hw/c/t1_touchbar_uinput.h
+@@ -21,7 +21,11 @@ enum t1_touchbar_key {
+ 
+ struct t1_touchbar_uinput;
+ 
+-/* Creates a virtual keyboard limited to Escape and F1 through F12. */
++#include <stddef.h>
++
++#define T1_TOUCHBAR_CHORD_MAX 4U
++
++/* Creates a virtual keyboard limited to the fixed key table. */
+ enum t1_touchbar_io_status t1_touchbar_uinput_create(
+ 	struct t1_touchbar_uinput **device);
+ 
+@@ -29,6 +33,14 @@ enum t1_touchbar_io_status t1_touchbar_uinput_create(
+ enum t1_touchbar_io_status t1_touchbar_uinput_tap(
+ 	struct t1_touchbar_uinput *device, enum t1_touchbar_key key);
+ 
++/*
++ * Presses up to T1_TOUCHBAR_CHORD_MAX distinct allowlisted Linux key codes in
++ * order, then releases them in reverse. Rejects unknown, duplicate or held keys
++ * before emitting anything.
++ */
++enum t1_touchbar_io_status t1_touchbar_uinput_chord(
++	struct t1_touchbar_uinput *device, const unsigned short *codes,
++	size_t count);
+ /* Retries release for every key whose prior release was not confirmed. */
+ enum t1_touchbar_io_status t1_touchbar_uinput_release_all(
+ 	struct t1_touchbar_uinput *device);
+diff --git a/crates/t1-touchbar-hw/c/test_t1_touchbar_io.c b/crates/t1-touchbar-hw/c/test_t1_touchbar_io.c
+index abca296..906bafa 100644
+--- a/crates/t1-touchbar-hw/c/test_t1_touchbar_io.c
++++ b/crates/t1-touchbar-hw/c/test_t1_touchbar_io.c
+@@ -337,6 +337,55 @@ static void test_uinput_key_allowlist(void)
+ 	EXPECT_TRUE(close(descriptors[0]) == 0);
+ }
+ 
++static void expect_key_event(int descriptor, uint16_t code, int value)
++{
++	struct input_event events[2];
++
++	read_complete(descriptor, events, sizeof(events));
++	EXPECT_TRUE(events[0].type == EV_KEY && events[0].code == code &&
++		    events[0].value == value);
++	EXPECT_TRUE(events[1].type == EV_SYN && events[1].code == SYN_REPORT);
++}
++
++static void test_uinput_chord(void)
++{
++	int descriptors[2];
++	struct t1_touchbar_uinput *device;
++	const unsigned short chord[] = { KEY_LEFTCTRL, KEY_LEFTALT, KEY_T };
++	const unsigned short unknown[] = { KEY_LEFTCTRL, KEY_POWER };
++	const unsigned short duplicate[] = { KEY_A, KEY_A };
++	const unsigned short five[] = { KEY_A, KEY_B, KEY_C, KEY_D, KEY_E };
++
++	EXPECT_TRUE(pipe2(descriptors, O_CLOEXEC | O_NONBLOCK) == 0);
++	device = t1_touchbar_uinput_test_device(descriptors[1]);
++	EXPECT_TRUE(device != NULL);
++	EXPECT_TRUE(t1_touchbar_uinput_chord(device, chord, 3U) ==
++		    T1_TOUCHBAR_IO_OK);
++	expect_key_event(descriptors[0], KEY_LEFTCTRL, 1);
++	expect_key_event(descriptors[0], KEY_LEFTALT, 1);
++	expect_key_event(descriptors[0], KEY_T, 1);
++	expect_key_event(descriptors[0], KEY_T, 0);
++	expect_key_event(descriptors[0], KEY_LEFTALT, 0);
++	expect_key_event(descriptors[0], KEY_LEFTCTRL, 0);
++	EXPECT_TRUE(t1_touchbar_uinput_test_held(device) == 0U);
++	EXPECT_TRUE(t1_touchbar_uinput_chord(device, unknown, 2U) ==
++		    T1_TOUCHBAR_IO_ERROR_ARGUMENT);
++	EXPECT_TRUE(t1_touchbar_uinput_chord(device, duplicate, 2U) ==
++		    T1_TOUCHBAR_IO_ERROR_ARGUMENT);
++	EXPECT_TRUE(t1_touchbar_uinput_chord(device, five, 5U) ==
++		    T1_TOUCHBAR_IO_ERROR_ARGUMENT);
++	EXPECT_TRUE(t1_touchbar_uinput_chord(device, chord, 0U) ==
++		    T1_TOUCHBAR_IO_ERROR_ARGUMENT);
++	{
++		struct input_event leftover;
++
++		/* Rejected chords emit nothing. */
++		EXPECT_TRUE(read(descriptors[0], &leftover, sizeof(leftover)) < 0);
++	}
++	EXPECT_TRUE(t1_touchbar_uinput_close(device) == T1_TOUCHBAR_IO_OK);
++	EXPECT_TRUE(close(descriptors[0]) == 0);
++}
++
+ static void test_tracked_keys_are_released_during_cleanup(void)
+ {
+ 	int descriptors[2];
+@@ -389,6 +438,7 @@ int main(void)
+ 	test_combined_event_poll();
+ 	test_fn_edges();
+ 	test_uinput_key_allowlist();
++	test_uinput_chord();
+ 	test_tracked_keys_are_released_during_cleanup();
+ 	test_argument_contracts();
+ 	puts("Touch Bar native I/O tests passed");
+diff --git a/crates/t1-touchbar-hw/src/service.rs b/crates/t1-touchbar-hw/src/service.rs
+index 7ae7689..5369df0 100644
+--- a/crates/t1-touchbar-hw/src/service.rs
++++ b/crates/t1-touchbar-hw/src/service.rs
+@@ -14,7 +14,7 @@ use t1_platform::system_brightness::{BrightnessKind, BrightnessStep, SystemBrigh
+ use t1_platform::touchbar_drm::{TouchBarDamageRectangle, TouchBarDisplay, TouchBarDrmError};
+ use t1_platform::touchbar_io::{
+     ClientInterest, DigitizerRead, EventWait, FnRead, ReadyInputs, TouchBarDigitizer,
+-    TouchBarFnInput, TouchBarKey, TouchBarKeyboard, wait_events,
++    TouchBarFnInput, TouchBarKeyboard, wait_events,
+ };
+ use t1_platform::touchbar_session::{
+     SessionBrightnessKind, SessionRevalidation, TouchBarSessionWatch,
+@@ -27,7 +27,7 @@ use crate::packet::MAX_PACKET_LENGTH;
+ use crate::touchid_cancel::{CancelTouchIdOutcome, cancel_touch_id};
+ use crate::wire::{
+     AncillaryMetadata, ClientMessage, Envelope, ErrorCode, FeatureBits, FrameReleased, HelloAck,
+-    InputContact, KeyCode, PixelFormat, ServiceMessage, SubmitFrame, WireInputFrame, decode_client,
++    InputContact, PixelFormat, ServiceMessage, SubmitFrame, WireInputFrame, decode_client,
+     encode_service,
+ };
+ 
+@@ -572,13 +572,13 @@ fn handle_request(
+             queue_frame_submission(connection, request_id, dimensions, &frame)
+         }
+         ClientMessage::TapKeys(keys) => {
+-            for key in keys.keys {
+-                if services.keyboard.tap(platform_key(key)).is_err() {
+-                    if services.keyboard.release_all().is_err() {
+-                        return Err(());
+-                    }
+-                    return connection.queue_error(request_id, ErrorCode::IoFailure, dimensions);
++            // Multiple keys form one chord: pressed in order, released in reverse.
++            let codes: Vec<u16> = keys.keys.iter().map(|key| key.wire_value()).collect();
++            if services.keyboard.chord(&codes).is_err() {
++                if services.keyboard.release_all().is_err() {
++                    return Err(());
+                 }
++                return connection.queue_error(request_id, ErrorCode::IoFailure, dimensions);
+             }
+             connection.queue_control(
+                 request_id,
+@@ -961,24 +961,6 @@ fn rounded_coordinate(value: f64, maximum: u32) -> u32 {
+     value.round().clamp(0.0, f64::from(maximum)) as u32
+ }
+ 
+-const fn platform_key(key: KeyCode) -> TouchBarKey {
+-    match key {
+-        KeyCode::Escape => TouchBarKey::Escape,
+-        KeyCode::F1 => TouchBarKey::F1,
+-        KeyCode::F2 => TouchBarKey::F2,
+-        KeyCode::F3 => TouchBarKey::F3,
+-        KeyCode::F4 => TouchBarKey::F4,
+-        KeyCode::F5 => TouchBarKey::F5,
+-        KeyCode::F6 => TouchBarKey::F6,
+-        KeyCode::F7 => TouchBarKey::F7,
+-        KeyCode::F8 => TouchBarKey::F8,
+-        KeyCode::F9 => TouchBarKey::F9,
+-        KeyCode::F10 => TouchBarKey::F10,
+-        KeyCode::F11 => TouchBarKey::F11,
+-        KeyCode::F12 => TouchBarKey::F12,
+-    }
+-}
+-
+ const fn frame_error_code(error: FrameStateError) -> ErrorCode {
+     match error {
+         FrameStateError::TooManyBuffers => ErrorCode::ResourceLimit,
+@@ -999,13 +981,6 @@ const fn frame_error_code(error: FrameStateError) -> ErrorCode {
+ mod tests {
+     use super::*;
+ 
+-    #[test]
+-    fn maps_only_the_wire_key_allowlist() {
+-        assert_eq!(platform_key(KeyCode::Escape), TouchBarKey::Escape);
+-        assert_eq!(platform_key(KeyCode::F1), TouchBarKey::F1);
+-        assert_eq!(platform_key(KeyCode::F12), TouchBarKey::F12);
+-    }
+-
+     #[test]
+     fn frame_failures_have_stable_public_categories() {
+         assert_eq!(
+diff --git a/crates/t1-touchbar-hw/src/wire.rs b/crates/t1-touchbar-hw/src/wire.rs
+index c61eea3..b0cf3a8 100644
+--- a/crates/t1-touchbar-hw/src/wire.rs
++++ b/crates/t1-touchbar-hw/src/wire.rs
+@@ -218,47 +218,156 @@ impl ErrorCode {
+     }
+ }
+ 
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-#[repr(u16)]
+-pub enum KeyCode {
+-    Escape = 1,
+-    F1 = 59,
+-    F2 = 60,
+-    F3 = 61,
+-    F4 = 62,
+-    F5 = 63,
+-    F6 = 64,
+-    F7 = 65,
+-    F8 = 66,
+-    F9 = 67,
+-    F10 = 68,
+-    F11 = 87,
+-    F12 = 88,
+-}
++/// One allowlisted Linux input key code.
++///
++/// Escape and F1-F12 are the stock keys; the rest of [`KeyCode::ALLOWED`] can be
++/// combined into user-configured chords. The table must match `key_codes` in
++/// `c/t1_touchbar_uinput.c`, which is the emitting allowlist.
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
++pub struct KeyCode(u16);
+ 
++#[allow(non_upper_case_globals)]
+ impl KeyCode {
++    pub const Escape: Self = Self(1);
++    pub const F1: Self = Self(59);
++    pub const F2: Self = Self(60);
++    pub const F3: Self = Self(61);
++    pub const F4: Self = Self(62);
++    pub const F5: Self = Self(63);
++    pub const F6: Self = Self(64);
++    pub const F7: Self = Self(65);
++    pub const F8: Self = Self(66);
++    pub const F9: Self = Self(67);
++    pub const F10: Self = Self(68);
++    pub const F11: Self = Self(87);
++    pub const F12: Self = Self(88);
++
++    /// Configuration names and Linux key codes of every emittable key.
++    pub const ALLOWED: &'static [(&'static str, u16)] = &[
++        ("esc", 1),
++        ("f1", 59),
++        ("f2", 60),
++        ("f3", 61),
++        ("f4", 62),
++        ("f5", 63),
++        ("f6", 64),
++        ("f7", 65),
++        ("f8", 66),
++        ("f9", 67),
++        ("f10", 68),
++        ("f11", 87),
++        ("f12", 88),
++        ("ctrl", 29),
++        ("rctrl", 97),
++        ("shift", 42),
++        ("rshift", 54),
++        ("alt", 56),
++        ("altgr", 100),
++        ("super", 125),
++        ("rsuper", 126),
++        ("a", 30),
++        ("b", 48),
++        ("c", 46),
++        ("d", 32),
++        ("e", 18),
++        ("f", 33),
++        ("g", 34),
++        ("h", 35),
++        ("i", 23),
++        ("j", 36),
++        ("k", 37),
++        ("l", 38),
++        ("m", 50),
++        ("n", 49),
++        ("o", 24),
++        ("p", 25),
++        ("q", 16),
++        ("r", 19),
++        ("s", 31),
++        ("t", 20),
++        ("u", 22),
++        ("v", 47),
++        ("w", 17),
++        ("x", 45),
++        ("y", 21),
++        ("z", 44),
++        ("1", 2),
++        ("2", 3),
++        ("3", 4),
++        ("4", 5),
++        ("5", 6),
++        ("6", 7),
++        ("7", 8),
++        ("8", 9),
++        ("9", 10),
++        ("0", 11),
++        ("tab", 15),
++        ("enter", 28),
++        ("space", 57),
++        ("backspace", 14),
++        ("delete", 111),
++        ("insert", 110),
++        ("home", 102),
++        ("end", 107),
++        ("pageup", 104),
++        ("pagedown", 109),
++        ("up", 103),
++        ("down", 108),
++        ("left", 105),
++        ("right", 106),
++        ("print", 99),
++        ("minus", 12),
++        ("equal", 13),
++        ("leftbrace", 26),
++        ("rightbrace", 27),
++        ("semicolon", 39),
++        ("apostrophe", 40),
++        ("grave", 41),
++        ("backslash", 43),
++        ("comma", 51),
++        ("dot", 52),
++        ("slash", 53),
++        ("f13", 183),
++        ("f14", 184),
++        ("f15", 185),
++        ("f16", 186),
++        ("f17", 187),
++        ("f18", 188),
++        ("f19", 189),
++        ("f20", 190),
++        ("f21", 191),
++        ("f22", 192),
++        ("f23", 193),
++        ("f24", 194),
++        ("mute", 113),
++        ("volumedown", 114),
++        ("volumeup", 115),
++        ("playpause", 164),
++        ("next", 163),
++        ("previous", 165),
++    ];
++
+     #[must_use]
+     pub const fn wire_value(self) -> u16 {
+-        self as u16
++        self.0
+     }
+ 
+-    const fn from_wire(value: u16) -> Option<Self> {
+-        Some(match value {
+-            1 => Self::Escape,
+-            59 => Self::F1,
+-            60 => Self::F2,
+-            61 => Self::F3,
+-            62 => Self::F4,
+-            63 => Self::F5,
+-            64 => Self::F6,
+-            65 => Self::F7,
+-            66 => Self::F8,
+-            67 => Self::F9,
+-            68 => Self::F10,
+-            87 => Self::F11,
+-            88 => Self::F12,
+-            _ => return None,
+-        })
++    /// Accepts only allowlisted key codes.
++    #[must_use]
++    pub fn from_wire(value: u16) -> Option<Self> {
++        Self::ALLOWED
++            .iter()
++            .any(|&(_, code)| code == value)
++            .then_some(Self(value))
++    }
++
++    /// Looks up a key by its configuration name, ignoring ASCII case.
++    #[must_use]
++    pub fn from_name(name: &str) -> Option<Self> {
++        Self::ALLOWED
++            .iter()
++            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
++            .map(|&(_, code)| Self(code))
+     }
+ }
+ 
+@@ -1092,6 +1201,30 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn chord_keys_are_allowlisted_by_code_and_name() {
++        assert_eq!(KeyCode::from_name("CTRL"), KeyCode::from_wire(29));
++        assert_eq!(KeyCode::from_name("t").map(KeyCode::wire_value), Some(20));
++        assert_eq!(KeyCode::from_name("f12"), Some(KeyCode::F12));
++        assert_eq!(KeyCode::from_name("power"), None);
++        assert_eq!(KeyCode::from_wire(116), None); // KEY_POWER
++        assert_eq!(KeyCode::from_wire(0), None);
++    }
++
++    #[test]
++    fn rust_allowlist_matches_native_emitting_table() {
++        let source = include_str!("../c/t1_touchbar_uinput.c");
++        let start = source.find("key_codes[] = {").expect("native table");
++        let end = start + source[start..].find("};").expect("table end");
++        let native: Vec<&str> = source[start..end]
++            .split(['{', ',', '\n', '\t', ' '])
++            .filter(|token| token.starts_with("KEY_"))
++            .collect();
++        assert_eq!(native.len(), KeyCode::ALLOWED.len());
++        // Spot-check order-independent identity through the stock prefix.
++        assert_eq!(&native[..2], &["KEY_ESC", "KEY_F1"]);
++    }
++
+     fn dimensions() -> DisplayDimensions {
+         DisplayDimensions::new(100, 20).expect("valid dimensions")
+     }
+diff --git a/crates/t1-touchbar/src/builtin_renderer.rs b/crates/t1-touchbar/src/builtin_renderer.rs
+index 90cead9..58fe0e1 100644
+--- a/crates/t1-touchbar/src/builtin_renderer.rs
++++ b/crates/t1-touchbar/src/builtin_renderer.rs
+@@ -19,6 +19,8 @@ use t1_touchbar_hw::wire::{
+ };
+ 
+ use crate::desktop_provider::{DesktopAction, DesktopCapabilities, DesktopProvider, DesktopState};
++use crate::config::{Config, ConfigWatcher, FnAction, Style};
++use crate::theme::{Theme, ThemeWatcher};
+ use crate::framebuffer::Xrgb8888Frame;
+ use crate::gesture::{DisplayContact, GestureEngine, GestureSettings};
+ use crate::overlay_state::{OverlayState, OverlayWatcher};
+@@ -72,12 +74,14 @@ impl std::error::Error for BuiltinRendererError {}
+ /// Runs the built-in renderer and reconnects forever with capped backoff.
+ pub fn run_forever(provider_path: Option<&Path>) {
+     let provider = provider_path.and_then(DesktopProvider::start);
++    let theme = ThemeWatcher::start();
++    let config = ConfigWatcher::start();
+     let mut delay = INITIAL_RECONNECT_DELAY;
+     loop {
+         if let Err(error) = t1_platform::diagnostics::observe(
+             t1_platform::diagnostics::Component::Renderer,
+             t1_platform::diagnostics::Stage::RendererConnect,
+-            || run_once(provider.as_ref()),
++            || run_once(provider.as_ref(), &theme, &config),
+         ) {
+             eprintln!("t1-touchbar: {error}; reconnecting");
+         }
+@@ -90,7 +94,11 @@ fn next_reconnect_delay(delay: Duration) -> Duration {
+     delay.saturating_mul(2).min(MAX_RECONNECT_DELAY)
+ }
+ 
+-fn run_once(provider: Option<&DesktopProvider>) -> Result<(), BuiltinRendererError> {
++fn run_once(
++    provider: Option<&DesktopProvider>,
++    theme: &ThemeWatcher,
++    config: &ConfigWatcher,
++) -> Result<(), BuiltinRendererError> {
+     let NegotiatedConnection {
+         mut connection,
+         request_ids,
+@@ -107,9 +115,19 @@ fn run_once(provider: Option<&DesktopProvider>) -> Result<(), BuiltinRendererErr
+     session.register(&connection)?;
+     let overlay_watcher = OverlayWatcher::start();
+     let clock = Instant::now();
++    let mut theme_seen = u64::MAX;
++    let mut config_seen = u64::MAX;
+ 
+     loop {
+         session.advance(clock.elapsed(), &connection, provider)?;
++        if let Some(theme) = theme.take_if_changed(&mut theme_seen) {
++            session.set_desktop_theme(theme);
++            session.submit_if_ready(&connection)?;
++        }
++        if let Some(config) = config.take_if_changed(&mut config_seen) {
++            session.set_config(config);
++            session.submit_if_ready(&connection)?;
++        }
+         if let Some(state) = provider.and_then(DesktopProvider::take_latest) {
+             session.set_desktop_state(state)?;
+             session.submit_if_ready(&connection)?;
+@@ -331,6 +349,8 @@ struct InFlightFrame {
+ 
+ struct RendererSession {
+     dimensions: DisplayDimensions,
++    desktop_theme: Theme,
++    config: Config,
+     stride: u32,
+     byte_length: u64,
+     stock: StockBar,
+@@ -382,6 +402,8 @@ impl RendererSession {
+         let input = InputInterpreter::new(dimensions, stock)?;
+         Ok(Self {
+             dimensions,
++            desktop_theme: Theme::DEFAULT,
++            config: Config::default(),
+             stride,
+             byte_length,
+             stock,
+@@ -631,6 +653,16 @@ impl RendererSession {
+         connection: &HardwareConnection,
+         provider: Option<&DesktopProvider>,
+     ) -> Result<(), BuiltinRendererError> {
++        if let StockAction::Function(function) = action {
++            match self.config.fn_actions[function_index(function)].clone() {
++                Some(FnAction::Keys(keys)) => return self.send_keys(&keys, connection),
++                Some(FnAction::Exec(command)) => {
++                    spawn_command(&command);
++                    return Ok(());
++                }
++                None => {}
++            }
++        }
+         if let Some(key) = action_key(action) {
+             return self.send_keys(&[key], connection);
+         }
+@@ -754,7 +786,13 @@ impl RendererSession {
+         .map_err(|_| BuiltinRendererError::Frame)?;
+         let fn_visible = self.input.fn_pressed() && self.overlay_visual_state.is_none();
+         self.stock
+-            .render_pressed(&mut frame, fn_visible, self.levels, self.input.pressed())
++            .render_decorated(
++                &mut frame,
++                fn_visible,
++                self.levels,
++                self.input.pressed(),
++                &self.config.decor,
++            )
+             .map_err(|_| BuiltinRendererError::Frame)?;
+         if self.overlay_opacity > 0 {
+             let left = self.stock.escape_right();
+@@ -923,6 +961,33 @@ impl RendererSession {
+         self.apply_desktop_state(state)
+     }
+ 
++    fn set_desktop_theme(&mut self, theme: Theme) {
++        self.desktop_theme = theme;
++        self.apply_theme();
++    }
++
++    fn set_config(&mut self, config: Config) {
++        self.config = config;
++        self.apply_theme();
++        self.dirty = true;
++    }
++
++    /// Combines the desktop style with the configured theme's overrides.
++    fn apply_theme(&mut self) {
++        let decor = &self.config.decor;
++        let dark = match decor.style {
++            Style::Gnome => self.desktop_theme.dark,
++            Style::Dark => true,
++            Style::Light => false,
++        };
++        let theme = Theme::adwaita(dark, decor.accent.unwrap_or(self.desktop_theme.accent));
++        if self.stock.theme() != theme {
++            self.stock = self.stock.with_theme(theme);
++            self.input.set_stock(self.stock);
++            self.dirty = true;
++        }
++    }
++
+     fn apply_desktop_state(&mut self, state: DesktopState) -> Result<(), BuiltinRendererError> {
+         let capabilities = self.hardware_capabilities | desktop_stock_capabilities(state);
+         let stock = StockBar::new(
+@@ -930,7 +995,8 @@ impl RendererSession {
+             self.dimensions.height(),
+             capabilities,
+         )
+-        .map_err(|_| BuiltinRendererError::Negotiation)?;
++        .map_err(|_| BuiltinRendererError::Negotiation)?
++        .with_theme(self.stock.theme());
+         self.stock = stock;
+         self.input.set_stock(stock);
+         self.levels.volume = state.volume;
+@@ -1209,6 +1275,45 @@ fn display_contact(contact: &InputContact) -> Result<DisplayContact, BuiltinRend
+     .map_err(|_| BuiltinRendererError::Gesture)
+ }
+ 
++const fn function_index(function: FunctionKey) -> usize {
++    match function {
++        FunctionKey::F1 => 0,
++        FunctionKey::F2 => 1,
++        FunctionKey::F3 => 2,
++        FunctionKey::F4 => 3,
++        FunctionKey::F5 => 4,
++        FunctionKey::F6 => 5,
++        FunctionKey::F7 => 6,
++        FunctionKey::F8 => 7,
++        FunctionKey::F9 => 8,
++        FunctionKey::F10 => 9,
++        FunctionKey::F11 => 10,
++        FunctionKey::F12 => 11,
++    }
++}
++
++/// Runs a user-configured command detached, as the session user.
++fn spawn_command(command: &str) {
++    use std::os::unix::process::CommandExt;
++    use std::process::{Command, Stdio};
++    let child = Command::new("/bin/sh")
++        .args(["-c", command])
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null())
++        .process_group(0)
++        .spawn();
++    match child {
++        // Reap in the background so finished commands never linger as zombies.
++        Ok(mut child) => {
++            thread::spawn(move || {
++                let _ = child.wait();
++            });
++        }
++        Err(error) => eprintln!("t1-touchbar: cannot run Fn command: {error}"),
++    }
++}
++
+ const fn action_key(action: StockAction) -> Option<KeyCode> {
+     Some(match action {
+         StockAction::Escape => KeyCode::Escape,
+diff --git a/crates/t1-touchbar/src/config.rs b/crates/t1-touchbar/src/config.rs
+new file mode 100644
+index 0000000..9107f3b
+--- /dev/null
++++ b/crates/t1-touchbar/src/config.rs
+@@ -0,0 +1,533 @@
++//! User configuration: theme selection, theme art, and Fn-row bindings.
++//!
++//! `${XDG_CONFIG_HOME:-~/.config}/t1bridge/touchbar.conf`:
++//!
++//! ```text
++//! theme = penguin                 # default | penguin | a directory under themes/
++//! fn.f1 = keys ctrl+alt+t         # up to four keys pressed together
++//! fn.f2 = exec firefox            # command run through `sh -c` as the user
++//! fn.f2.icon = icons/firefox.png  # optional PNG shown instead of "F2"
++//! ```
++//!
++//! A theme is `themes/<name>/theme.conf` plus its PNG files:
++//!
++//! ```text
++//! style = gnome          # gnome | dark | light
++//! accent = gnome         # gnome | #rrggbb
++//! background = bg.png    # whole-bar image behind the buttons
++//! background.opacity = 100
++//! buttons.opacity = 100  # lower lets the background show through buttons
++//! watermark = penguin    # none | penguin | file.png, drawn behind each label
++//! watermark.scale = 0.9  # times the button height; above 1 is cropped
++//! watermark.opacity = 13
++//! watermark.x = 0        # pixel offset from the button center
++//! watermark.y = 0
++//! mascot = tux           # none | tux | file.png, in the gap after Escape
++//! ```
++//!
++//! Relative paths resolve against the file that names them. Errors are reported
++//! to the journal and the affected setting falls back to its default.
++
++use std::collections::BTreeMap;
++use std::env;
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::thread;
++use std::time::{Duration, SystemTime};
++
++use t1_touchbar_hw::wire::{KeyCode, MAX_KEYS};
++
++use crate::framebuffer::Rgb;
++use crate::png::{self, Image};
++
++const POLL_INTERVAL: Duration = Duration::from_secs(1);
++const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
++const FUNCTION_KEYS: usize = 12;
++
++/// What a Fn-row key does when it is bound.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum FnAction {
++    Keys(Vec<KeyCode>),
++    Exec(String),
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Style {
++    Gnome,
++    Dark,
++    Light,
++}
++
++/// Decorative art slot.
++#[derive(Clone, Debug, Default)]
++pub enum Art {
++    #[default]
++    None,
++    /// Built-in penguin silhouette (watermark) or Tux mascot.
++    Builtin,
++    Image(Arc<Image>),
++}
++
++/// Everything the theme adds on top of the stock layout.
++#[derive(Clone, Debug)]
++pub struct Decor {
++    pub style: Style,
++    pub accent: Option<Rgb>,
++    pub background: Option<Arc<Image>>,
++    pub background_opacity: u8,
++    pub plate_opacity: u8,
++    pub watermark: Art,
++    pub watermark_scale: f32,
++    pub watermark_opacity: u8,
++    pub watermark_offset: (i32, i32),
++    pub mascot: Art,
++    pub fn_icons: [Option<Arc<Image>>; FUNCTION_KEYS],
++}
++
++impl Default for Decor {
++    fn default() -> Self {
++        Self {
++            style: Style::Gnome,
++            accent: None,
++            background: None,
++            background_opacity: 255,
++            plate_opacity: 255,
++            watermark: Art::None,
++            watermark_scale: 0.9,
++            watermark_opacity: percent_to_alpha(13),
++            watermark_offset: (0, 0),
++            mascot: Art::None,
++            fn_icons: Default::default(),
++        }
++    }
++}
++
++/// One fully loaded configuration.
++#[derive(Clone, Debug, Default)]
++pub struct Config {
++    pub decor: Arc<Decor>,
++    pub fn_actions: [Option<FnAction>; FUNCTION_KEYS],
++}
++
++fn percent_to_alpha(percent: u32) -> u8 {
++    u8::try_from(percent.min(100) * 255 / 100).unwrap_or(255)
++}
++
++fn config_dir() -> Option<PathBuf> {
++    env::var_os("XDG_CONFIG_HOME")
++        .map(PathBuf::from)
++        .filter(|path| path.is_absolute())
++        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
++        .map(|base| base.join("t1bridge"))
++}
++
++/// Parses `key = value` lines, skipping blanks and `#` comments.
++fn parse_pairs(text: &str, warnings: &mut Vec<String>, origin: &Path) -> BTreeMap<String, String> {
++    let mut pairs = BTreeMap::new();
++    for (number, line) in text.lines().enumerate() {
++        let line = line.trim();
++        if line.is_empty() || line.starts_with('#') {
++            continue;
++        }
++        let Some((key, value)) = line.split_once('=') else {
++            warnings.push(format!("{}:{}: expected key = value", origin.display(), number + 1));
++            continue;
++        };
++        // A trailing comment needs whitespace before '#', so `#rrggbb` values survive.
++        let value = value.trim();
++        let value = value.split(" #").next().unwrap_or_default().trim();
++        pairs.insert(key.trim().to_ascii_lowercase(), value.to_owned());
++    }
++    pairs
++}
++
++/// Parses `ctrl+alt+t` into at most four distinct allowlisted keys.
++fn parse_keys(spec: &str) -> Result<Vec<KeyCode>, String> {
++    let mut keys = Vec::new();
++    for name in spec.split('+').map(str::trim) {
++        let key = KeyCode::from_name(name).ok_or_else(|| format!("unknown key '{name}'"))?;
++        if keys.contains(&key) {
++            return Err(format!("key '{name}' repeated"));
++        }
++        keys.push(key);
++    }
++    if keys.is_empty() || keys.len() > MAX_KEYS {
++        return Err(format!("use 1 to {MAX_KEYS} keys"));
++    }
++    Ok(keys)
++}
++
++fn parse_action(value: &str) -> Result<FnAction, String> {
++    let (kind, rest) = value.split_once(char::is_whitespace).unwrap_or((value, ""));
++    let rest = rest.trim();
++    match kind {
++        "keys" => parse_keys(rest).map(FnAction::Keys),
++        "exec" if !rest.is_empty() => Ok(FnAction::Exec(rest.to_owned())),
++        _ => Err("expected 'keys a+b' or 'exec command'".to_owned()),
++    }
++}
++
++fn parse_color(value: &str) -> Option<Rgb> {
++    let hex = value.strip_prefix('#')?;
++    if hex.len() != 6 {
++        return None;
++    }
++    let channel = |range| u8::from_str_radix(hex.get(range)?, 16).ok();
++    Some(Rgb {
++        red: channel(0..2)?,
++        green: channel(2..4)?,
++        blue: channel(4..6)?,
++    })
++}
++
++/// Loads files and records each path consulted so changes trigger a reload.
++struct Loader {
++    warnings: Vec<String>,
++    watched: Vec<PathBuf>,
++}
++
++impl Loader {
++    fn read_text(&mut self, path: &Path) -> Option<String> {
++        self.watched.push(path.to_path_buf());
++        let metadata = fs::metadata(path).ok()?;
++        if metadata.len() > MAX_FILE_BYTES {
++            self.warnings.push(format!("{}: file too large", path.display()));
++            return None;
++        }
++        match fs::read_to_string(path) {
++            Ok(text) => Some(text),
++            Err(error) => {
++                self.warnings.push(format!("{}: {error}", path.display()));
++                None
++            }
++        }
++    }
++
++    fn image(&mut self, base: &Path, value: &str) -> Option<Arc<Image>> {
++        let path = resolve(base, value);
++        self.watched.push(path.clone());
++        let bytes = fs::metadata(&path)
++            .ok()
++            .filter(|metadata| metadata.len() <= MAX_FILE_BYTES)
++            .and_then(|_| fs::read(&path).ok());
++        let Some(bytes) = bytes else {
++            self.warnings
++                .push(format!("{}: cannot read image", path.display()));
++            return None;
++        };
++        match png::decode(&bytes) {
++            Ok(image) => Some(Arc::new(image)),
++            Err(error) => {
++                self.warnings.push(format!("{}: {error}", path.display()));
++                None
++            }
++        }
++    }
++
++    fn number<T: std::str::FromStr>(&mut self, pairs: &BTreeMap<String, String>, key: &str) -> Option<T> {
++        let value = pairs.get(key)?;
++        let parsed = value.parse().ok();
++        if parsed.is_none() {
++            self.warnings.push(format!("{key}: '{value}' is not a number"));
++        }
++        parsed
++    }
++
++    fn art(&mut self, base: &Path, value: Option<&String>, builtin: &str) -> Option<Art> {
++        let value = value?;
++        Some(match value.as_str() {
++            "none" => Art::None,
++            name if name == builtin => Art::Builtin,
++            file => self.image(base, file).map_or(Art::None, Art::Image),
++        })
++    }
++
++    fn theme(&mut self, directory: Option<&Path>, name: &str) -> Decor {
++        let mut decor = Decor::default();
++        let text = directory.and_then(|directory| {
++            let path = directory.join("theme.conf");
++            self.watched.push(directory.to_path_buf());
++            self.read_text(&path).map(|text| (text, path))
++        });
++        let pairs = match (text, name) {
++            (Some((text, path)), _) => parse_pairs(&text, &mut self.warnings, &path),
++            (None, "default") => BTreeMap::new(),
++            (None, "penguin") => parse_pairs(
++                "watermark = penguin\nmascot = tux\n",
++                &mut self.warnings,
++                Path::new("builtin"),
++            ),
++            (None, other) => {
++                self.warnings.push(format!("theme '{other}' not found; using default"));
++                BTreeMap::new()
++            }
++        };
++        let base = directory.unwrap_or_else(|| Path::new("/"));
++        decor.style = match pairs.get("style").map(String::as_str) {
++            None | Some("gnome") => Style::Gnome,
++            Some("dark") => Style::Dark,
++            Some("light") => Style::Light,
++            Some(other) => {
++                self.warnings.push(format!("style '{other}' unknown"));
++                Style::Gnome
++            }
++        };
++        decor.accent = match pairs.get("accent").map(String::as_str) {
++            None | Some("gnome") => None,
++            Some(value) => {
++                let color = parse_color(value);
++                if color.is_none() {
++                    self.warnings.push(format!("accent '{value}' is not #rrggbb"));
++                }
++                color
++            }
++        };
++        if let Some(value) = pairs.get("background").filter(|value| *value != "none") {
++            decor.background = self.image(base, value);
++        }
++        if let Some(percent) = self.number::<u32>(&pairs, "background.opacity") {
++            decor.background_opacity = percent_to_alpha(percent);
++        }
++        if let Some(percent) = self.number::<u32>(&pairs, "buttons.opacity") {
++            decor.plate_opacity = percent_to_alpha(percent);
++        }
++        if let Some(art) = self.art(base, pairs.get("watermark"), "penguin") {
++            decor.watermark = art;
++        }
++        if let Some(scale) = self.number::<f32>(&pairs, "watermark.scale") {
++            decor.watermark_scale = scale.clamp(0.1, 10.0);
++        }
++        if let Some(percent) = self.number::<u32>(&pairs, "watermark.opacity") {
++            decor.watermark_opacity = percent_to_alpha(percent);
++        }
++        if let Some(x) = self.number::<i32>(&pairs, "watermark.x") {
++            decor.watermark_offset.0 = x.clamp(-2_000, 2_000);
++        }
++        if let Some(y) = self.number::<i32>(&pairs, "watermark.y") {
++            decor.watermark_offset.1 = y.clamp(-2_000, 2_000);
++        }
++        if let Some(art) = self.art(base, pairs.get("mascot"), "tux") {
++            decor.mascot = art;
++        }
++        decor
++    }
++
++    fn load(&mut self, directory: &Path) -> Config {
++        let path = directory.join("touchbar.conf");
++        let pairs = self
++            .read_text(&path)
++            .map(|text| parse_pairs(&text, &mut self.warnings, &path))
++            .unwrap_or_default();
++        let name = pairs.get("theme").map_or("default", String::as_str).to_owned();
++        let theme_directory = (!name.contains('/') && !name.starts_with('.'))
++            .then(|| directory.join("themes").join(&name))
++            .filter(|candidate| candidate.is_dir() || {
++                self.watched.push(candidate.clone());
++                false
++            });
++        let mut decor = self.theme(theme_directory.as_deref(), &name);
++        let mut fn_actions: [Option<FnAction>; FUNCTION_KEYS] = Default::default();
++        for (index, slot) in fn_actions.iter_mut().enumerate() {
++            let key = format!("fn.f{}", index + 1);
++            if let Some(value) = pairs.get(&key) {
++                match parse_action(value) {
++                    Ok(action) => *slot = Some(action),
++                    Err(error) => self.warnings.push(format!("{key}: {error}")),
++                }
++            }
++            if let Some(icon) = pairs.get(&format!("{key}.icon")) {
++                decor.fn_icons[index] = self.image(directory, icon);
++            }
++        }
++        for key in pairs.keys() {
++            let known = key == "theme"
++                || key
++                    .strip_prefix("fn.f")
++                    .map(|rest| rest.trim_end_matches(".icon"))
++                    .and_then(|number| number.parse::<usize>().ok())
++                    .is_some_and(|number| (1..=FUNCTION_KEYS).contains(&number));
++            if !known {
++                self.warnings.push(format!("{}: unknown setting '{key}'", path.display()));
++            }
++        }
++        Config {
++            decor: Arc::new(decor),
++            fn_actions,
++        }
++    }
++}
++
++/// Expands `~/` and resolves relative paths against `base`.
++fn resolve(base: &Path, value: &str) -> PathBuf {
++    if let Some(rest) = value.strip_prefix("~/") {
++        if let Some(home) = env::var_os("HOME") {
++            return PathBuf::from(home).join(rest);
++        }
++    }
++    let path = PathBuf::from(value);
++    if path.is_absolute() {
++        path
++    } else {
++        base.join(path)
++    }
++}
++
++fn fingerprint(paths: &[PathBuf]) -> Vec<Option<(SystemTime, u64)>> {
++    paths
++        .iter()
++        .map(|path| {
++            fs::metadata(path)
++                .ok()
++                .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())))
++        })
++        .collect()
++}
++
++/// Reloads the configuration whenever any consulted file changes.
++pub struct ConfigWatcher {
++    current: Arc<Mutex<Config>>,
++    generation: Arc<AtomicU64>,
++}
++
++impl ConfigWatcher {
++    #[must_use]
++    pub fn start() -> Self {
++        let current = Arc::new(Mutex::new(Config::default()));
++        let generation = Arc::new(AtomicU64::new(0));
++        let (worker_current, worker_generation) = (Arc::clone(&current), Arc::clone(&generation));
++        thread::spawn(move || {
++            let Some(directory) = config_dir() else {
++                return;
++            };
++            let mut watched: Vec<PathBuf> = Vec::new();
++            let mut stamp = Vec::new();
++            let mut first = true;
++            loop {
++                if first || fingerprint(&watched) != stamp {
++                    first = false;
++                    let mut loader = Loader {
++                        warnings: Vec::new(),
++                        watched: vec![directory.clone()],
++                    };
++                    let config = loader.load(&directory);
++                    for warning in &loader.warnings {
++                        eprintln!("t1-touchbar: config: {warning}");
++                    }
++                    watched = loader.watched;
++                    stamp = fingerprint(&watched);
++                    if let Ok(mut slot) = worker_current.lock() {
++                        *slot = config;
++                    }
++                    worker_generation.fetch_add(1, Ordering::AcqRel);
++                }
++                thread::sleep(POLL_INTERVAL);
++            }
++        });
++        Self {
++            current,
++            generation,
++        }
++    }
++
++    /// Returns the configuration when it changed since `seen`, updating `seen`.
++    pub fn take_if_changed(&self, seen: &mut u64) -> Option<Config> {
++        let generation = self.generation.load(Ordering::Acquire);
++        if generation == *seen {
++            return None;
++        }
++        *seen = generation;
++        self.current.lock().ok().map(|config| config.clone())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn load(directory: &Path) -> (Config, Vec<String>) {
++        let mut loader = Loader {
++            warnings: Vec::new(),
++            watched: Vec::new(),
++        };
++        let config = loader.load(directory);
++        (config, loader.warnings)
++    }
++
++    fn scratch(name: &str) -> PathBuf {
++        let directory = env::temp_dir().join(format!("t1-touchbar-config-{name}-{}", std::process::id()));
++        let _ = fs::remove_dir_all(&directory);
++        fs::create_dir_all(&directory).unwrap();
++        directory
++    }
++
++    #[test]
++    fn parses_bindings_and_reports_mistakes() {
++        let directory = scratch("bindings");
++        fs::write(
++            directory.join("touchbar.conf"),
++            "# comment\ntheme = penguin\nfn.f1 = keys ctrl+alt+t\nfn.f2 = exec firefox --new-window\n\
++             fn.f3 = keys ctrl+power\nfn.f4 = keys a+b+c+d+e\nfn.f13 = keys a\nbogus line\n",
++        )
++        .unwrap();
++        let (config, warnings) = load(&directory);
++        assert_eq!(
++            config.fn_actions[0],
++            Some(FnAction::Keys(vec![
++                KeyCode::from_name("ctrl").unwrap(),
++                KeyCode::from_name("alt").unwrap(),
++                KeyCode::from_name("t").unwrap(),
++            ]))
++        );
++        assert_eq!(
++            config.fn_actions[1],
++            Some(FnAction::Exec("firefox --new-window".into()))
++        );
++        assert_eq!(config.fn_actions[2], None);
++        assert_eq!(config.fn_actions[3], None);
++        assert!(matches!(config.decor.watermark, Art::Builtin));
++        assert!(matches!(config.decor.mascot, Art::Builtin));
++        assert_eq!(warnings.len(), 4, "{warnings:?}");
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn missing_config_is_plain_default() {
++        let directory = scratch("missing");
++        let (config, warnings) = load(&directory);
++        assert!(warnings.is_empty());
++        assert!(matches!(config.decor.watermark, Art::None));
++        assert!(config.fn_actions.iter().all(Option::is_none));
++        fs::remove_dir_all(directory).unwrap();
++    }
++
++    #[test]
++    fn user_theme_overrides_and_falls_back_per_setting() {
++        let directory = scratch("theme");
++        let theme = directory.join("themes/mine");
++        fs::create_dir_all(&theme).unwrap();
++        fs::write(directory.join("touchbar.conf"), "theme = mine\n").unwrap();
++        fs::write(
++            theme.join("theme.conf"),
++            "style = light\naccent = #ff8800\nwatermark = missing.png\nwatermark.scale = 1.5\n\
++             buttons.opacity = 50\nmascot = none\n",
++        )
++        .unwrap();
++        let (config, warnings) = load(&directory);
++        assert_eq!(config.decor.style, Style::Light);
++        assert_eq!(
++            config.decor.accent,
++            Some(Rgb {
++                red: 255,
++                green: 136,
++                blue: 0
++            })
++        );
++        assert!(matches!(config.decor.watermark, Art::None));
++        assert!((config.decor.watermark_scale - 1.5).abs() < f32::EPSILON);
++        assert_eq!(config.decor.plate_opacity, 127);
++        assert_eq!(warnings.len(), 1, "{warnings:?}");
++        fs::remove_dir_all(directory).unwrap();
++    }
++}
+diff --git a/crates/t1-touchbar/src/decor.rs b/crates/t1-touchbar/src/decor.rs
+new file mode 100644
+index 0000000..3fd8ec0
+--- /dev/null
++++ b/crates/t1-touchbar/src/decor.rs
+@@ -0,0 +1,218 @@
++//! Theme art composition: scaled, clipped, alpha-blended RGBA images.
++
++use std::sync::{Arc, OnceLock};
++
++use crate::framebuffer::{FramebufferError, Rectangle, Rgb, Xrgb8888Frame};
++use crate::png::Image;
++use crate::tux;
++
++/// Supersampling grid per output pixel; smooths downscaled art.
++const SAMPLES: u32 = 3;
++
++/// Where and how to place an image.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Placement {
++    /// Destination rectangle in panel pixels; may extend past `clip`.
++    pub x: f32,
++    pub y: f32,
++    pub width: f32,
++    pub height: f32,
++    /// Only pixels inside this rectangle (with rounded corners) are touched.
++    pub clip: Rectangle,
++    pub radius: f32,
++    /// Overall opacity multiplied into the image alpha.
++    pub opacity: u8,
++    /// Replaces image color while keeping its alpha (for silhouettes).
++    pub tint: Option<Rgb>,
++}
++
++impl Placement {
++    /// Centers `image` in `bounds` at `height` pixels tall, shifted by `offset`.
++    pub(crate) fn centered(image: &Image, bounds: Rectangle, height: f32, offset: (i32, i32)) -> Self {
++        #[allow(clippy::cast_precision_loss)]
++        let width = height * image.width as f32 / image.height as f32;
++        #[allow(clippy::cast_precision_loss)]
++        Self {
++            x: bounds.x as f32 + (bounds.width as f32 - width) / 2.0 + offset.0 as f32,
++            y: bounds.y as f32 + (bounds.height as f32 - height) / 2.0 + offset.1 as f32,
++            width,
++            height,
++            clip: bounds,
++            radius: 0.0,
++            opacity: 255,
++            tint: None,
++        }
++    }
++
++    /// Scales `image` to cover `bounds` completely (cropping the overflow).
++    pub(crate) fn cover(image: &Image, bounds: Rectangle) -> Self {
++        #[allow(clippy::cast_precision_loss)]
++        let scale = (bounds.width as f32 / image.width as f32)
++            .max(bounds.height as f32 / image.height as f32);
++        #[allow(clippy::cast_precision_loss)]
++        let height = image.height as f32 * scale;
++        Self::centered(image, bounds, height, (0, 0))
++    }
++
++    /// Fits `image` entirely inside `bounds` scaled by `fill`.
++    pub(crate) fn contain(image: &Image, bounds: Rectangle, fill: f32) -> Self {
++        #[allow(clippy::cast_precision_loss)]
++        let scale = (bounds.width as f32 / image.width as f32)
++            .min(bounds.height as f32 / image.height as f32)
++            * fill;
++        #[allow(clippy::cast_precision_loss)]
++        let height = image.height as f32 * scale;
++        Self::centered(image, bounds, height, (0, 0))
++    }
++}
++
++/// Built-in penguin silhouette (white, alpha = coverage), rendered once.
++pub(crate) fn penguin_silhouette() -> Arc<Image> {
++    static SILHOUETTE: OnceLock<Arc<Image>> = OnceLock::new();
++    Arc::clone(SILHOUETTE.get_or_init(|| Arc::new(tux::silhouette(240))))
++}
++
++#[allow(
++    clippy::cast_precision_loss,
++    clippy::cast_possible_truncation,
++    clippy::cast_sign_loss,
++    clippy::cast_possible_wrap
++)]
++pub(crate) fn draw_image(
++    frame: &mut Xrgb8888Frame<'_>,
++    image: &Image,
++    placement: Placement,
++) -> Result<(), FramebufferError> {
++    if placement.width <= 0.0 || placement.height <= 0.0 || placement.opacity == 0 {
++        return Ok(());
++    }
++    let clip = placement.clip;
++    let left = placement.x.floor().max(clip.x as f32) as u32;
++    let top = placement.y.floor().max(clip.y as f32) as u32;
++    let right = ((placement.x + placement.width).ceil() as i64)
++        .min(i64::from(clip.x + clip.width))
++        .max(0) as u32;
++    let bottom = ((placement.y + placement.height).ceil() as i64)
++        .min(i64::from(clip.y + clip.height))
++        .max(0) as u32;
++    if left >= right || top >= bottom {
++        return Ok(());
++    }
++    let area = Rectangle {
++        x: left,
++        y: top,
++        width: right - left,
++        height: bottom - top,
++    };
++    let scale_x = image.width as f32 / placement.width;
++    let scale_y = image.height as f32 / placement.height;
++    let (cl, ct) = (clip.x as f32, clip.y as f32);
++    let (cr, cb) = (cl + clip.width as f32, ct + clip.height as f32);
++    let radius = placement.radius.min(clip.width as f32 / 2.0).min(clip.height as f32 / 2.0);
++    let mut colors = Vec::with_capacity((area.width * area.height) as usize);
++    let mut mask = Vec::with_capacity((area.width * area.height) as usize);
++    for py in area.y..area.y + area.height {
++        for px in area.x..area.x + area.width {
++            let (mut red, mut green, mut blue, mut alpha) = (0u32, 0u32, 0u32, 0u32);
++            for sy in 0..SAMPLES {
++                for sx in 0..SAMPLES {
++                    let x = px as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
++                    let y = py as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
++                    if radius > 0.0 {
++                        let nx = x.clamp(cl + radius, cr - radius);
++                        let ny = y.clamp(ct + radius, cb - radius);
++                        if (x - nx).powi(2) + (y - ny).powi(2) > radius * radius {
++                            continue;
++                        }
++                    }
++                    let ix = ((x - placement.x) * scale_x).floor();
++                    let iy = ((y - placement.y) * scale_y).floor();
++                    if ix < 0.0 || iy < 0.0 || ix >= image.width as f32 || iy >= image.height as f32 {
++                        continue;
++                    }
++                    let [r, g, b, a] = image.pixel(ix as u32, iy as u32);
++                    let a = u32::from(a);
++                    red += u32::from(r) * a;
++                    green += u32::from(g) * a;
++                    blue += u32::from(b) * a;
++                    alpha += a;
++                }
++            }
++            let count = SAMPLES * SAMPLES;
++            let color = match placement.tint {
++                Some(tint) => tint,
++                None if alpha > 0 => Rgb {
++                    red: (red / alpha) as u8,
++                    green: (green / alpha) as u8,
++                    blue: (blue / alpha) as u8,
++                },
++                None => Rgb {
++                    red: 0,
++                    green: 0,
++                    blue: 0,
++                },
++            };
++            colors.push(color);
++            mask.push((alpha / count * u32::from(placement.opacity) / 255) as u8);
++        }
++    }
++    frame.blend_pixels(area, &mask, &colors)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn frame_pixels(width: u32, height: u32) -> Vec<u8> {
++        vec![0; (width * height * 4) as usize]
++    }
++
++    fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Image {
++        Image {
++            width,
++            height,
++            rgba: rgba.repeat((width * height) as usize),
++        }
++    }
++
++    #[test]
++    fn oversized_art_is_clipped_to_its_bounds() {
++        let mut pixels = frame_pixels(40, 10);
++        let mut frame = Xrgb8888Frame::new(40, 10, 160, &mut pixels).unwrap();
++        let clip = Rectangle {
++            x: 10,
++            y: 0,
++            width: 10,
++            height: 10,
++        };
++        let image = solid(4, 4, [255, 0, 0, 255]);
++        let placement = Placement::centered(&image, clip, 40.0, (0, 0));
++        draw_image(&mut frame, &image, placement).unwrap();
++        for x in 0..40u32 {
++            let red = pixels[(x * 4 + 2) as usize];
++            assert_eq!(red == 255, (10..20).contains(&x), "x={x}");
++        }
++    }
++
++    #[test]
++    fn opacity_and_tint_apply() {
++        let mut pixels = frame_pixels(4, 4);
++        let mut frame = Xrgb8888Frame::new(4, 4, 16, &mut pixels).unwrap();
++        let bounds = Rectangle {
++            x: 0,
++            y: 0,
++            width: 4,
++            height: 4,
++        };
++        let image = solid(2, 2, [255, 255, 255, 255]);
++        let mut placement = Placement::cover(&image, bounds);
++        placement.opacity = 128;
++        placement.tint = Some(Rgb {
++            red: 0,
++            green: 200,
++            blue: 0,
++        });
++        draw_image(&mut frame, &image, placement).unwrap();
++        assert_eq!(&pixels[0..4], &[0, 100, 0, 0]);
++    }
++}
+diff --git a/crates/t1-touchbar/src/framebuffer.rs b/crates/t1-touchbar/src/framebuffer.rs
+index aa9389a..1c94560 100644
+--- a/crates/t1-touchbar/src/framebuffer.rs
++++ b/crates/t1-touchbar/src/framebuffer.rs
+@@ -288,6 +288,56 @@ impl<'pixels> Xrgb8888Frame<'pixels> {
+         }
+         Ok(())
+     }
++
++    /// Blends per-pixel colors with per-pixel alpha over an in-bounds rectangle.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`FramebufferError::RectangleOutOfBounds`] when the rectangle is
++    /// empty or outside the frame, or when either slice is not `width * height`.
++    pub fn blend_pixels(
++        &mut self,
++        rectangle: Rectangle,
++        mask: &[u8],
++        colors: &[Rgb],
++    ) -> Result<(), FramebufferError> {
++        let expected = usize::try_from(u64::from(rectangle.width) * u64::from(rectangle.height))
++            .map_err(|_| FramebufferError::RectangleOutOfBounds)?;
++        if rectangle.width == 0
++            || rectangle.height == 0
++            || mask.len() != expected
++            || colors.len() != expected
++            || rectangle.x.checked_add(rectangle.width).is_none_or(|right| right > self.width)
++            || rectangle.y.checked_add(rectangle.height).is_none_or(|bottom| bottom > self.height)
++        {
++            return Err(FramebufferError::RectangleOutOfBounds);
++        }
++        let width = usize::try_from(rectangle.width).unwrap_or(0);
++        for row in 0..rectangle.height {
++            for column in 0..rectangle.width {
++                let index = usize::try_from(row).unwrap_or(0) * width
++                    + usize::try_from(column).unwrap_or(0);
++                let alpha = u16::from(mask[index]);
++                if alpha == 0 {
++                    continue;
++                }
++                let offset = usize::try_from(
++                    u64::from(rectangle.y + row) * u64::from(self.stride)
++                        + u64::from(rectangle.x + column) * u64::from(BYTES_PER_PIXEL),
++                )
++                .map_err(|_| FramebufferError::RectangleOutOfBounds)?;
++                let pixel = self
++                    .pixels
++                    .get_mut(offset..offset + 4)
++                    .ok_or(FramebufferError::RectangleOutOfBounds)?;
++                let color = colors[index];
++                pixel[0] = blend_channel(pixel[0], color.blue, alpha);
++                pixel[1] = blend_channel(pixel[1], color.green, alpha);
++                pixel[2] = blend_channel(pixel[2], color.red, alpha);
++            }
++        }
++        Ok(())
++    }
+ }
+ 
+ fn blend_channel(background: u8, foreground: u8, alpha: u16) -> u8 {
+diff --git a/crates/t1-touchbar/src/lib.rs b/crates/t1-touchbar/src/lib.rs
+index 43722b7..53dd08d 100644
+--- a/crates/t1-touchbar/src/lib.rs
++++ b/crates/t1-touchbar/src/lib.rs
+@@ -1,14 +1,19 @@
+ //! Unprivileged Touch Bar rendering and optional desktop integration.
+ 
+ pub mod builtin_renderer;
++pub mod config;
++mod decor;
+ pub mod desktop_provider;
+ pub mod framebuffer;
+ pub mod gesture;
+ mod overlay_labels;
++pub mod png;
+ pub mod overlay_state;
+ pub mod renderer_launcher;
+ mod stock_art;
+ mod stock_icons;
+ mod stock_labels;
+ pub mod stock_slice;
++pub mod theme;
+ pub mod touch_id_overlay;
++mod tux;
+diff --git a/crates/t1-touchbar/src/png.rs b/crates/t1-touchbar/src/png.rs
+new file mode 100644
+index 0000000..587af42
+--- /dev/null
++++ b/crates/t1-touchbar/src/png.rs
+@@ -0,0 +1,531 @@
++//! Minimal dependency-free PNG decoder for user theme images.
++//!
++//! Supports non-interlaced 8-bit grayscale, gray+alpha, RGB, RGBA and indexed
++//! images (with `tRNS`). Output is straight (non-premultiplied) RGBA. Runs only
++//! in the unprivileged renderer and bounds every size before allocating.
++
++use std::fmt;
++
++const SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
++/// Largest accepted side and decoded size; theme art is at most a few panels wide.
++const MAX_SIDE: u32 = 8_192;
++const MAX_PIXELS: u64 = 4 * 1024 * 1024;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum PngError {
++    NotPng,
++    Unsupported,
++    TooLarge,
++    Corrupt,
++}
++
++impl fmt::Display for PngError {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str(match self {
++            Self::NotPng => "not a PNG file",
++            Self::Unsupported => "unsupported PNG (use 8-bit, non-interlaced)",
++            Self::TooLarge => "PNG is too large",
++            Self::Corrupt => "corrupt PNG",
++        })
++    }
++}
++
++impl std::error::Error for PngError {}
++
++/// Decoded straight-alpha RGBA image.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub struct Image {
++    pub width: u32,
++    pub height: u32,
++    pub rgba: Vec<u8>,
++}
++
++impl Image {
++    #[must_use]
++    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
++        let offset = ((y as usize) * (self.width as usize) + x as usize) * 4;
++        [
++            self.rgba[offset],
++            self.rgba[offset + 1],
++            self.rgba[offset + 2],
++            self.rgba[offset + 3],
++        ]
++    }
++}
++
++/// Decodes a PNG byte stream.
++///
++/// # Errors
++///
++/// Returns [`PngError`] for anything other than a well-formed supported PNG.
++pub fn decode(bytes: &[u8]) -> Result<Image, PngError> {
++    if bytes.len() < 8 || bytes[..8] != SIGNATURE {
++        return Err(PngError::NotPng);
++    }
++    let mut position = 8;
++    let mut header = None;
++    let mut palette: Vec<[u8; 3]> = Vec::new();
++    let mut transparency: Vec<u8> = Vec::new();
++    let mut compressed = Vec::new();
++    loop {
++        let length = read_u32(bytes, position)? as usize;
++        let kind = bytes.get(position + 4..position + 8).ok_or(PngError::Corrupt)?;
++        let data = bytes
++            .get(position + 8..position + 8 + length)
++            .ok_or(PngError::Corrupt)?;
++        position += 12 + length;
++        match kind {
++            b"IHDR" => header = Some(Header::parse(data)?),
++            b"PLTE" => {
++                palette = data
++                    .chunks_exact(3)
++                    .map(|entry| [entry[0], entry[1], entry[2]])
++                    .collect();
++            }
++            b"tRNS" => transparency = data.to_vec(),
++            b"IDAT" => compressed.extend_from_slice(data),
++            b"IEND" => break,
++            _ => {}
++        }
++    }
++    let header = header.ok_or(PngError::Corrupt)?;
++    let channels = header.channels();
++    let stride = header.width as usize * channels;
++    let raw = inflate_zlib(&compressed, (stride + 1) * header.height as usize)?;
++    let pixels = unfilter(&raw, stride, channels, header.height as usize)?;
++    let mut rgba = Vec::with_capacity(header.width as usize * header.height as usize * 4);
++    for sample in pixels.chunks_exact(channels) {
++        let pixel = match header.color {
++            0 => [sample[0], sample[0], sample[0], 255],
++            2 => [sample[0], sample[1], sample[2], 255],
++            3 => {
++                let index = usize::from(sample[0]);
++                let [red, green, blue] = *palette.get(index).ok_or(PngError::Corrupt)?;
++                [red, green, blue, transparency.get(index).copied().unwrap_or(255)]
++            }
++            4 => [sample[0], sample[0], sample[0], sample[1]],
++            _ => [sample[0], sample[1], sample[2], sample[3]],
++        };
++        rgba.extend_from_slice(&pixel);
++    }
++    Ok(Image {
++        width: header.width,
++        height: header.height,
++        rgba,
++    })
++}
++
++struct Header {
++    width: u32,
++    height: u32,
++    color: u8,
++}
++
++impl Header {
++    fn parse(data: &[u8]) -> Result<Self, PngError> {
++        if data.len() != 13 {
++            return Err(PngError::Corrupt);
++        }
++        let width = read_u32(data, 0)?;
++        let height = read_u32(data, 4)?;
++        let (depth, color, compression, filter, interlace) =
++            (data[8], data[9], data[10], data[11], data[12]);
++        if width == 0 || height == 0 {
++            return Err(PngError::Corrupt);
++        }
++        if width > MAX_SIDE
++            || height > MAX_SIDE
++            || u64::from(width) * u64::from(height) > MAX_PIXELS
++        {
++            return Err(PngError::TooLarge);
++        }
++        if depth != 8 || !matches!(color, 0 | 2 | 3 | 4 | 6) || compression != 0 || filter != 0
++        {
++            return Err(PngError::Unsupported);
++        }
++        if interlace != 0 {
++            return Err(PngError::Unsupported);
++        }
++        Ok(Self {
++            width,
++            height,
++            color,
++        })
++    }
++
++    const fn channels(&self) -> usize {
++        match self.color {
++            0 | 3 => 1,
++            4 => 2,
++            2 => 3,
++            _ => 4,
++        }
++    }
++}
++
++fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, PngError> {
++    let slice = bytes.get(offset..offset + 4).ok_or(PngError::Corrupt)?;
++    Ok(u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
++}
++
++fn unfilter(
++    raw: &[u8],
++    stride: usize,
++    channels: usize,
++    rows: usize,
++) -> Result<Vec<u8>, PngError> {
++    if raw.len() != (stride + 1) * rows {
++        return Err(PngError::Corrupt);
++    }
++    let mut out = vec![0u8; stride * rows];
++    for row in 0..rows {
++        let filter = raw[row * (stride + 1)];
++        let source = &raw[row * (stride + 1) + 1..(row + 1) * (stride + 1)];
++        let (done, current) = out.split_at_mut(row * stride);
++        let previous = if row == 0 { None } else { Some(&done[(row - 1) * stride..]) };
++        let current = &mut current[..stride];
++        for index in 0..stride {
++            let left = if index >= channels { current[index - channels] } else { 0 };
++            let up = previous.map_or(0, |line| line[index]);
++            let up_left = match previous {
++                Some(line) if index >= channels => line[index - channels],
++                _ => 0,
++            };
++            let predictor = match filter {
++                0 => 0,
++                1 => left,
++                2 => up,
++                3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
++                4 => paeth(left, up, up_left),
++                _ => return Err(PngError::Corrupt),
++            };
++            current[index] = source[index].wrapping_add(predictor);
++        }
++    }
++    Ok(out)
++}
++
++fn paeth(a: u8, b: u8, c: u8) -> u8 {
++    let p = i16::from(a) + i16::from(b) - i16::from(c);
++    let (pa, pb, pc) = (
++        (p - i16::from(a)).abs(),
++        (p - i16::from(b)).abs(),
++        (p - i16::from(c)).abs(),
++    );
++    if pa <= pb && pa <= pc {
++        a
++    } else if pb <= pc {
++        b
++    } else {
++        c
++    }
++}
++
++struct BitReader<'a> {
++    data: &'a [u8],
++    position: usize,
++    bit: u32,
++}
++
++impl BitReader<'_> {
++    fn bits(&mut self, count: u32) -> Result<u32, PngError> {
++        let mut value = 0;
++        for shift in 0..count {
++            let byte = *self.data.get(self.position).ok_or(PngError::Corrupt)?;
++            value |= u32::from((byte >> self.bit) & 1) << shift;
++            self.bit += 1;
++            if self.bit == 8 {
++                self.bit = 0;
++                self.position += 1;
++            }
++        }
++        Ok(value)
++    }
++
++    fn align(&mut self) {
++        if self.bit != 0 {
++            self.bit = 0;
++            self.position += 1;
++        }
++    }
++}
++
++/// Canonical Huffman decoding table (counts per length plus sorted symbols).
++struct Huffman {
++    counts: [u16; 16],
++    symbols: Vec<u16>,
++}
++
++impl Huffman {
++    fn new(lengths: &[u8]) -> Result<Self, PngError> {
++        let mut counts = [0u16; 16];
++        for &length in lengths {
++            counts[usize::from(length)] += 1;
++        }
++        counts[0] = 0;
++        let mut offsets = [0u16; 16];
++        for length in 1..16 {
++            offsets[length] = offsets[length - 1] + counts[length - 1];
++        }
++        let mut symbols = vec![0u16; lengths.len()];
++        for (symbol, &length) in lengths.iter().enumerate() {
++            if length != 0 {
++                let slot = &mut offsets[usize::from(length)];
++                *symbols.get_mut(usize::from(*slot)).ok_or(PngError::Corrupt)? =
++                    u16::try_from(symbol).map_err(|_| PngError::Corrupt)?;
++                *slot += 1;
++            }
++        }
++        Ok(Self { counts, symbols })
++    }
++
++    fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16, PngError> {
++        let (mut code, mut first, mut index) = (0i32, 0i32, 0i32);
++        for length in 1..16 {
++            code |= i32::try_from(reader.bits(1)?).map_err(|_| PngError::Corrupt)?;
++            let count = i32::from(self.counts[length]);
++            if code - count < first {
++                let slot = usize::try_from(index + (code - first)).map_err(|_| PngError::Corrupt)?;
++                return self.symbols.get(slot).copied().ok_or(PngError::Corrupt);
++            }
++            index += count;
++            first += count;
++            first <<= 1;
++            code <<= 1;
++        }
++        Err(PngError::Corrupt)
++    }
++}
++
++const LENGTH_BASE: [u16; 29] = [
++    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
++    131, 163, 195, 227, 258,
++];
++const LENGTH_EXTRA: [u8; 29] = [
++    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
++];
++const DISTANCE_BASE: [u16; 30] = [
++    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
++    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
++];
++const DISTANCE_EXTRA: [u8; 30] = [
++    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
++    13,
++];
++const CODE_LENGTH_ORDER: [usize; 19] =
++    [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
++
++/// Inflates a zlib stream whose output must be exactly `expected` bytes.
++fn inflate_zlib(data: &[u8], expected: usize) -> Result<Vec<u8>, PngError> {
++    if data.len() < 2 || data[0] & 0x0f != 8 || (u16::from(data[0]) << 8 | u16::from(data[1])) % 31 != 0
++    {
++        return Err(PngError::Corrupt);
++    }
++    if data[1] & 0x20 != 0 {
++        return Err(PngError::Unsupported);
++    }
++    let mut reader = BitReader {
++        data: &data[2..],
++        position: 0,
++        bit: 0,
++    };
++    let mut out: Vec<u8> = Vec::with_capacity(expected);
++    loop {
++        let last = reader.bits(1)? == 1;
++        match reader.bits(2)? {
++            0 => {
++                reader.align();
++                let header = reader
++                    .data
++                    .get(reader.position..reader.position + 4)
++                    .ok_or(PngError::Corrupt)?;
++                let length = usize::from(u16::from_le_bytes([header[0], header[1]]));
++                let start = reader.position + 4;
++                let block = reader
++                    .data
++                    .get(start..start + length)
++                    .ok_or(PngError::Corrupt)?;
++                if out.len() + length > expected {
++                    return Err(PngError::Corrupt);
++                }
++                out.extend_from_slice(block);
++                reader.position = start + length;
++            }
++            1 => {
++                let mut lengths = [0u8; 288];
++                lengths[..144].fill(8);
++                lengths[144..256].fill(9);
++                lengths[256..280].fill(7);
++                lengths[280..].fill(8);
++                let literal = Huffman::new(&lengths)?;
++                let distance = Huffman::new(&[5u8; 30])?;
++                inflate_block(&mut reader, &literal, &distance, &mut out, expected)?;
++            }
++            2 => {
++                let (literal, distance) = dynamic_tables(&mut reader)?;
++                inflate_block(&mut reader, &literal, &distance, &mut out, expected)?;
++            }
++            _ => return Err(PngError::Corrupt),
++        }
++        if last {
++            break;
++        }
++    }
++    if out.len() == expected {
++        Ok(out)
++    } else {
++        Err(PngError::Corrupt)
++    }
++}
++
++fn dynamic_tables(reader: &mut BitReader<'_>) -> Result<(Huffman, Huffman), PngError> {
++    let literals = reader.bits(5)? as usize + 257;
++    let distances = reader.bits(5)? as usize + 1;
++    let code_lengths = reader.bits(4)? as usize + 4;
++    let mut order = [0u8; 19];
++    for &slot in CODE_LENGTH_ORDER.iter().take(code_lengths) {
++        order[slot] = u8::try_from(reader.bits(3)?).map_err(|_| PngError::Corrupt)?;
++    }
++    let code = Huffman::new(&order)?;
++    let mut lengths = vec![0u8; literals + distances];
++    let mut index = 0;
++    while index < lengths.len() {
++        let symbol = code.decode(reader)?;
++        let (value, repeat) = match symbol {
++            0..=15 => (u8::try_from(symbol).map_err(|_| PngError::Corrupt)?, 1),
++            16 => {
++                let previous = *lengths
++                    .get(index.checked_sub(1).ok_or(PngError::Corrupt)?)
++                    .ok_or(PngError::Corrupt)?;
++                (previous, 3 + reader.bits(2)? as usize)
++            }
++            17 => (0, 3 + reader.bits(3)? as usize),
++            18 => (0, 11 + reader.bits(7)? as usize),
++            _ => return Err(PngError::Corrupt),
++        };
++        let target = lengths
++            .get_mut(index..index + repeat)
++            .ok_or(PngError::Corrupt)?;
++        target.fill(value);
++        index += repeat;
++    }
++    Ok((
++        Huffman::new(&lengths[..literals])?,
++        Huffman::new(&lengths[literals..])?,
++    ))
++}
++
++fn inflate_block(
++    reader: &mut BitReader<'_>,
++    literal: &Huffman,
++    distance: &Huffman,
++    out: &mut Vec<u8>,
++    expected: usize,
++) -> Result<(), PngError> {
++    loop {
++        let symbol = usize::from(literal.decode(reader)?);
++        match symbol {
++            0..=255 => {
++                if out.len() >= expected {
++                    return Err(PngError::Corrupt);
++                }
++                out.push(u8::try_from(symbol).map_err(|_| PngError::Corrupt)?);
++            }
++            256 => return Ok(()),
++            257..=285 => {
++                let slot = symbol - 257;
++                let length = usize::from(LENGTH_BASE[slot])
++                    + reader.bits(u32::from(LENGTH_EXTRA[slot]))? as usize;
++                let distance_slot = usize::from(distance.decode(reader)?);
++                let base = *DISTANCE_BASE.get(distance_slot).ok_or(PngError::Corrupt)?;
++                let back = usize::from(base)
++                    + reader.bits(u32::from(DISTANCE_EXTRA[distance_slot]))? as usize;
++                if back > out.len() || out.len() + length > expected {
++                    return Err(PngError::Corrupt);
++                }
++                let start = out.len() - back;
++                for offset in 0..length {
++                    out.push(out[start + offset]);
++                }
++            }
++            _ => return Err(PngError::Corrupt),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn chunk(kind: &[u8], data: &[u8]) -> Vec<u8> {
++        let mut out = u32::try_from(data.len()).unwrap().to_be_bytes().to_vec();
++        out.extend_from_slice(kind);
++        out.extend_from_slice(data);
++        out.extend_from_slice(&[0; 4]); // CRC is not verified
++        out
++    }
++
++    /// Stored (uncompressed) zlib stream.
++    fn zlib_stored(raw: &[u8]) -> Vec<u8> {
++        let mut out = vec![0x78, 0x01, 0x01];
++        let length = u16::try_from(raw.len()).unwrap();
++        out.extend_from_slice(&length.to_le_bytes());
++        out.extend_from_slice(&(!length).to_le_bytes());
++        out.extend_from_slice(raw);
++        out.extend_from_slice(&[0; 4]);
++        out
++    }
++
++    fn png(width: u32, height: u32, color: u8, raw: &[u8]) -> Vec<u8> {
++        let mut header = width.to_be_bytes().to_vec();
++        header.extend_from_slice(&height.to_be_bytes());
++        header.extend_from_slice(&[8, color, 0, 0, 0]);
++        let mut out = SIGNATURE.to_vec();
++        out.extend(chunk(b"IHDR", &header));
++        out.extend(chunk(b"IDAT", &zlib_stored(raw)));
++        out.extend(chunk(b"IEND", &[]));
++        out
++    }
++
++    #[test]
++    fn decodes_rgba_with_sub_and_up_filters() {
++        // Row 0 filter Sub, row 1 filter Up.
++        let raw = [
++            1, 10, 20, 30, 255, 5, 5, 5, 0, //
++            2, 1, 1, 1, 0, 1, 1, 1, 0,
++        ];
++        let image = decode(&png(2, 2, 6, &raw)).unwrap();
++        assert_eq!(image.pixel(0, 0), [10, 20, 30, 255]);
++        assert_eq!(image.pixel(1, 0), [15, 25, 35, 255]);
++        assert_eq!(image.pixel(0, 1), [11, 21, 31, 255]);
++        assert_eq!(image.pixel(1, 1), [16, 26, 36, 255]);
++    }
++
++    #[test]
++    fn decodes_gray_and_fixed_huffman_stream() {
++        // zlib fixed-Huffman stream of bytes [0, 7, 0, 9] produced by zlib level 9.
++        let compressed = [0x78, 0xda, 0x63, 0x60, 0x67, 0xe0, 0x04, 0x00, 0x00, 0x22, 0x00, 0x11];
++        let mut header = 1u32.to_be_bytes().to_vec();
++        header.extend_from_slice(&2u32.to_be_bytes());
++        header.extend_from_slice(&[8, 0, 0, 0, 0]);
++        let mut bytes = SIGNATURE.to_vec();
++        bytes.extend(chunk(b"IHDR", &header));
++        bytes.extend(chunk(b"IDAT", &compressed));
++        bytes.extend(chunk(b"IEND", &[]));
++        let image = decode(&bytes).unwrap();
++        assert_eq!(image.pixel(0, 0), [7, 7, 7, 255]);
++        assert_eq!(image.pixel(0, 1), [9, 9, 9, 255]);
++    }
++
++    #[test]
++    fn rejects_bad_inputs() {
++        assert_eq!(decode(b"GIF89a"), Err(PngError::NotPng));
++        let mut sixteen_bit = png(1, 1, 0, &[0, 0]);
++        sixteen_bit[8 + 8 + 8] = 16;
++        assert_eq!(decode(&sixteen_bit), Err(PngError::Unsupported));
++        assert_eq!(decode(&png(1, 1, 0, &[0])), Err(PngError::Corrupt));
++        assert_eq!(decode(&png(9_000, 1, 0, &[])), Err(PngError::TooLarge));
++        let truncated = &png(1, 1, 0, &[0, 0])[..30];
++        assert!(decode(truncated).is_err());
++    }
++}
+diff --git a/crates/t1-touchbar/src/stock_art.rs b/crates/t1-touchbar/src/stock_art.rs
+index ad49165..2168480 100644
+--- a/crates/t1-touchbar/src/stock_art.rs
++++ b/crates/t1-touchbar/src/stock_art.rs
+@@ -27,6 +27,7 @@ pub(crate) fn draw_rounded_plate(
+     bounds: Rectangle,
+     radius: u32,
+     color: Rgb,
++    opacity: u8,
+ ) -> Result<(), FramebufferError> {
+     let width = bounds.width;
+     let height = bounds.height;
+@@ -45,6 +46,13 @@ pub(crate) fn draw_rounded_plate(
+         let dy = y - center_y;
+         dx * dx + dy * dy <= radius * radius
+     });
++    let mask: Vec<u8> = if opacity == 255 {
++        mask
++    } else {
++        mask.into_iter()
++            .map(|alpha| u8::try_from(u16::from(alpha) * u16::from(opacity) / 255).unwrap_or(255))
++            .collect()
++    };
+     frame.blend_mask(bounds, &mask, color)
+ }
+ 
+diff --git a/crates/t1-touchbar/src/stock_slice.rs b/crates/t1-touchbar/src/stock_slice.rs
+index 4c0ae87..8c2d465 100644
+--- a/crates/t1-touchbar/src/stock_slice.rs
++++ b/crates/t1-touchbar/src/stock_slice.rs
+@@ -6,35 +6,26 @@ use crate::framebuffer::{FramebufferError, Rectangle, Rgb, Xrgb8888Frame};
+ use crate::gesture::{DisplayContact, Gesture};
+ use crate::stock_art::{self, Symbol};
+ use crate::stock_labels::{self, AlphaMask};
++use std::sync::Arc;
++
++use crate::config::{Art, Decor};
++use crate::decor::{self, Placement};
++use crate::theme::Theme;
++use crate::tux;
+ 
+ const NATIVE_WIDTH: u32 = 2_170;
+ const NATIVE_HEIGHT: u32 = 60;
+ const ACTIVE_RIGHT: u32 = NATIVE_WIDTH;
+ const FUNCTION_SLOT_COUNT: u32 = 13;
++/// macOS system Escape key: 64 pt at 2x, flush with the panel's left edge.
++const ESCAPE_WIDTH: u32 = 128;
+ const PLATE_Y: u32 = 0;
+ const PLATE_HEIGHT: u32 = 60;
+ const PLATE_RADIUS: u32 = 8;
++/// Custom Fn icons and mascot images fill this fraction of their slot.
++const FN_ICON_FILL: f32 = 0.7;
++const MASCOT_FILL: f32 = 0.9;
+ 
+-const BACKGROUND: Rgb = Rgb {
+-    red: 0,
+-    green: 0,
+-    blue: 0,
+-};
+-const PLATE: Rgb = Rgb {
+-    red: 53,
+-    green: 53,
+-    blue: 53,
+-};
+-const PRESSED_PLATE: Rgb = Rgb {
+-    red: 76,
+-    green: 76,
+-    blue: 76,
+-};
+-const LABEL: Rgb = Rgb {
+-    red: 242,
+-    green: 242,
+-    blue: 242,
+-};
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum FunctionKey {
+@@ -223,6 +214,7 @@ pub struct StockBar {
+     width: u32,
+     height: u32,
+     capabilities: StockCapabilities,
++    theme: Theme,
+ }
+ 
+ impl StockBar {
+@@ -241,10 +233,23 @@ impl StockBar {
+                 width,
+                 height,
+                 capabilities,
++                theme: Theme::DEFAULT,
+             })
+         }
+     }
+ 
++    /// Returns this layout drawn with `theme`.
++    #[must_use]
++    pub const fn with_theme(mut self, theme: Theme) -> Self {
++        self.theme = theme;
++        self
++    }
++
++    #[must_use]
++    pub const fn theme(self) -> Theme {
++        self.theme
++    }
++
+     #[must_use]
+     pub const fn width(self) -> u32 {
+         self.width
+@@ -284,15 +289,42 @@ impl StockBar {
+         fn_held: bool,
+         levels: StockLevels,
+         pressed: Option<StockAction>,
++    ) -> Result<(), StockSliceError> {
++        self.render_decorated(frame, fn_held, levels, pressed, &Decor::default())
++    }
++
++    /// Draws the surface with theme art from `decor`.
++    ///
++    /// # Errors
++    ///
++    /// Rejects a changed frame geometry or an internally invalid draw.
++    pub fn render_decorated(
++        self,
++        frame: &mut Xrgb8888Frame<'_>,
++        fn_held: bool,
++        levels: StockLevels,
++        pressed: Option<StockAction>,
++        decor: &Decor,
+     ) -> Result<(), StockSliceError> {
+         if frame.width() != self.width || frame.height() != self.height {
+             return Err(StockSliceError::FrameGeometryMismatch);
+         }
+-        frame.clear(BACKGROUND);
++        frame.clear(self.theme.background);
++        if let Some(image) = &decor.background {
++            let whole = Rectangle {
++                x: 0,
++                y: 0,
++                width: self.width,
++                height: self.height,
++            };
++            let mut placement = Placement::cover(image, whole);
++            placement.opacity = decor.background_opacity;
++            decor::draw_image(frame, image, placement)?;
++        }
+         if fn_held {
+-            self.render_function_row(frame, pressed)
++            self.render_function_row(frame, pressed, decor)
+         } else {
+-            self.render_normal_row(frame, levels, pressed)
++            self.render_normal_row(frame, levels, pressed, decor)
+         }
+     }
+ 
+@@ -330,17 +362,24 @@ impl StockBar {
+         frame: &mut Xrgb8888Frame<'_>,
+         _levels: StockLevels,
+         pressed: Option<StockAction>,
++        decor: &Decor,
+     ) -> Result<(), StockSliceError> {
+-        self.draw_plate(frame, self.escape_bounds(), StockAction::Escape, pressed)?;
+-        stock_art::draw_label(frame, self.escape_bounds(), stock_labels::ESC, LABEL)?;
++        self.draw_plate(frame, self.escape_bounds(), StockAction::Escape, pressed, decor)?;
++        stock_art::draw_label(
++            frame,
++            self.escape_bounds(),
++            stock_labels::ESC,
++            self.label_color(StockAction::Escape, pressed),
++        )?;
++        self.draw_mascot(frame, decor)?;
+         for item in self.normal_controls() {
+             if !self.control_visible(item.control) {
+                 continue;
+             }
+             let action = control_action(item.control);
+-            self.draw_plate(frame, item.bounds, action, pressed)?;
++            self.draw_plate(frame, item.bounds, action, pressed, decor)?;
+             let symbol = control_symbol(item.control);
+-            stock_art::draw_symbol(frame, item.bounds, symbol, LABEL)?;
++            stock_art::draw_symbol(frame, item.bounds, symbol, self.label_color(action, pressed))?;
+         }
+         Ok(())
+     }
+@@ -349,6 +388,7 @@ impl StockBar {
+         self,
+         frame: &mut Xrgb8888Frame<'_>,
+         pressed: Option<StockAction>,
++        decor: &Decor,
+     ) -> Result<(), StockSliceError> {
+         for slot in 0..FUNCTION_SLOT_COUNT {
+             let bounds = self.function_slot(slot);
+@@ -356,8 +396,24 @@ impl StockBar {
+                 continue;
+             }
+             let action = function_action(slot).ok_or(StockSliceError::InvalidGeometry)?;
+-            self.draw_plate(frame, bounds, action, pressed)?;
+-            stock_art::draw_label(frame, bounds, function_label(action)?, LABEL)?;
++            self.draw_plate(frame, bounds, action, pressed, decor)?;
++            let icon = usize::try_from(slot)
++                .ok()
++                .and_then(|slot| slot.checked_sub(1))
++                .and_then(|index| decor.fn_icons.get(index))
++                .and_then(Option::as_ref);
++            if let Some(icon) = icon {
++                let mut placement = Placement::contain(icon, bounds, FN_ICON_FILL);
++                placement.clip = bounds;
++                decor::draw_image(frame, icon, placement)?;
++                continue;
++            }
++            stock_art::draw_label(
++                frame,
++                bounds,
++                function_label(action)?,
++                self.label_color(action, pressed),
++            )?;
+         }
+         Ok(())
+     }
+@@ -368,17 +424,76 @@ impl StockBar {
+         bounds: Rectangle,
+         action: StockAction,
+         pressed: Option<StockAction>,
++        decor: &Decor,
+     ) -> Result<(), StockSliceError> {
++        let radius = self.scaled_y(PLATE_RADIUS).max(1);
+         stock_art::draw_rounded_plate(
+             frame,
+             bounds,
+-            self.scaled_y(PLATE_RADIUS).max(1),
++            radius,
+             if pressed == Some(action) {
+-                PRESSED_PLATE
++                self.theme.pressed_plate
+             } else {
+-                PLATE
++                self.theme.plate
+             },
++            decor.plate_opacity,
+         )?;
++        let (image, tint) = match &decor.watermark {
++            Art::None => return Ok(()),
++            Art::Builtin => (
++                decor::penguin_silhouette(),
++                Some(self.label_color(action, pressed)),
++            ),
++            Art::Image(image) => (Arc::clone(image), None),
++        };
++        #[allow(clippy::cast_precision_loss)]
++        let height = bounds.height as f32 * decor.watermark_scale;
++        let mut placement = Placement::centered(&image, bounds, height, decor.watermark_offset);
++        #[allow(clippy::cast_precision_loss)]
++        {
++            placement.radius = radius as f32;
++        }
++        placement.opacity = decor.watermark_opacity;
++        placement.tint = tint;
++        decor::draw_image(frame, &image, placement)?;
++        Ok(())
++    }
++
++    fn label_color(self, action: StockAction, pressed: Option<StockAction>) -> Rgb {
++        if pressed == Some(action) {
++            self.theme.pressed_label
++        } else {
++            self.theme.label
++        }
++    }
++
++    /// Penguin in the empty gap between Escape and the first control group.
++    fn draw_mascot(self, frame: &mut Xrgb8888Frame<'_>, decor: &Decor) -> Result<(), StockSliceError> {
++        if matches!(decor.mascot, Art::None) {
++            return Ok(());
++        }
++        let escape = self.escape_bounds();
++        let left = escape.x + escape.width;
++        let Some(right) = self.normal_controls().first().map(|item| item.bounds.x) else {
++            return Ok(());
++        };
++        let width = right.saturating_sub(left);
++        if width < self.scaled_x(tux::NATIVE_WIDTH / 2) {
++            return Ok(());
++        }
++        let bounds = Rectangle {
++            x: left,
++            y: 0,
++            width,
++            height: self.height,
++        };
++        match &decor.mascot {
++            Art::Image(image) => {
++                decor::draw_image(frame, image, Placement::contain(image, bounds, MASCOT_FILL))?;
++            }
++            Art::Builtin => tux::draw(frame, bounds, self.theme.accent)?,
++            Art::None => {}
++        }
+         Ok(())
+     }
+ 
+@@ -386,10 +501,16 @@ impl StockBar {
+         if x >= self.active_right() || y >= self.height {
+             return None;
+         }
+-        let slot = u32::try_from(
+-            u64::from(x) * u64::from(FUNCTION_SLOT_COUNT) / u64::from(self.active_right()),
+-        )
+-        .ok()?;
++        let escape_right = self.escape_slot_right();
++        let slot = if x < escape_right {
++            0
++        } else {
++            1 + u32::try_from(
++                u64::from(x - escape_right) * u64::from(FUNCTION_SLOT_COUNT - 1)
++                    / u64::from(self.active_right() - escape_right),
++            )
++            .ok()?
++        };
+         let bounds = self.function_slot(slot);
+         contains(bounds, x, y)
+             .then(|| function_action(slot))
+@@ -401,9 +522,16 @@ impl StockBar {
+     }
+ 
+     fn function_slot(self, slot: u32) -> Rectangle {
+-        let active_right = self.active_right();
+-        let left = ceiling_partition(slot, active_right, FUNCTION_SLOT_COUNT);
+-        let right = ceiling_partition(slot + 1, active_right, FUNCTION_SLOT_COUNT);
++        let escape_right = self.escape_slot_right();
++        let (left, right) = if slot == 0 {
++            (0, escape_right)
++        } else {
++            let keys = self.active_right() - escape_right;
++            (
++                escape_right + ceiling_partition(slot - 1, keys, FUNCTION_SLOT_COUNT - 1),
++                escape_right + ceiling_partition(slot, keys, FUNCTION_SLOT_COUNT - 1),
++            )
++        };
+         let inset = self.scaled_x(5).min((right - left) / 2);
+         let left_inset = if slot == 0 { 0 } else { inset };
+         Rectangle {
+@@ -453,6 +581,11 @@ impl StockBar {
+         ) || self.control_available(control)
+     }
+ 
++    fn escape_slot_right(self) -> u32 {
++        self.scaled_x(ESCAPE_WIDTH)
++            .clamp(1, self.active_right().saturating_sub(FUNCTION_SLOT_COUNT - 1))
++    }
++
+     fn active_right(self) -> u32 {
+         scale(ACTIVE_RIGHT, self.width, NATIVE_WIDTH).max(1)
+     }
+diff --git a/crates/t1-touchbar/src/theme.rs b/crates/t1-touchbar/src/theme.rs
+new file mode 100644
+index 0000000..96c0a80
+--- /dev/null
++++ b/crates/t1-touchbar/src/theme.rs
+@@ -0,0 +1,242 @@
++//! GNOME interface theme (accent color and light/dark style) for the built-in surface.
++//!
++//! The watcher runs the unprivileged `gsettings` client in the user session;
++//! a missing client or non-GNOME desktop simply keeps the default palette.
++
++use std::io::{BufRead, BufReader};
++use std::process::{Command, Stdio};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
++use std::thread;
++use std::time::Duration;
++
++use crate::framebuffer::Rgb;
++
++const SCHEMA: &str = "org.gnome.desktop.interface";
++const RESTART_DELAY: Duration = Duration::from_secs(5);
++
++const fn rgb(red: u8, green: u8, blue: u8) -> Rgb {
++    Rgb { red, green, blue }
++}
++
++/// Colors used by the stock surface.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct Theme {
++    pub dark: bool,
++    pub background: Rgb,
++    pub plate: Rgb,
++    pub pressed_plate: Rgb,
++    pub label: Rgb,
++    pub pressed_label: Rgb,
++    pub accent: Rgb,
++}
++
++impl Theme {
++    /// The original neutral palette, used when no desktop theme is known.
++    pub const DEFAULT: Self = Self {
++        dark: true,
++        background: rgb(0, 0, 0),
++        plate: rgb(53, 53, 53),
++        pressed_plate: rgb(76, 76, 76),
++        label: rgb(242, 242, 242),
++        pressed_label: rgb(242, 242, 242),
++        accent: rgb(53, 132, 228),
++    };
++
++    /// Adwaita-style plates; the background stays black so the OLED blends with the bezel.
++    #[must_use]
++    pub const fn adwaita(dark: bool, accent: Rgb) -> Self {
++        let (plate, label) = if dark {
++            (rgb(58, 58, 62), rgb(242, 242, 242))
++        } else {
++            (rgb(222, 222, 226), rgb(46, 46, 50))
++        };
++        Self {
++            dark,
++            background: rgb(0, 0, 0),
++            plate,
++            pressed_plate: accent,
++            label,
++            pressed_label: rgb(255, 255, 255),
++            accent,
++        }
++    }
++}
++
++impl Default for Theme {
++    fn default() -> Self {
++        Self::DEFAULT
++    }
++}
++
++/// GNOME 47+ accent palette (`accent-color` key).
++fn accent_rgb(name: &str) -> Option<Rgb> {
++    Some(match name {
++        "blue" => rgb(53, 132, 228),
++        "teal" => rgb(33, 144, 164),
++        "green" => rgb(58, 148, 74),
++        "yellow" => rgb(200, 136, 0),
++        "orange" => rgb(237, 91, 0),
++        "red" => rgb(230, 45, 66),
++        "pink" => rgb(213, 97, 153),
++        "purple" => rgb(145, 65, 172),
++        "slate" => rgb(111, 131, 150),
++        _ => return None,
++    })
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++struct Settings {
++    accent: String,
++    color_scheme: String,
++}
++
++impl Settings {
++    fn theme(&self) -> Theme {
++        Theme::adwaita(
++            self.color_scheme != "prefer-light",
++            accent_rgb(&self.accent).unwrap_or(Theme::DEFAULT.accent),
++        )
++    }
++
++    /// Applies one `gsettings monitor` line such as `accent-color: 'teal'`.
++    fn apply_line(&mut self, line: &str) -> bool {
++        let Some((key, value)) = line.split_once(':') else {
++            return false;
++        };
++        let value = unquote(value);
++        let slot = match key.trim() {
++            "accent-color" => &mut self.accent,
++            "color-scheme" => &mut self.color_scheme,
++            _ => return false,
++        };
++        if *slot == value {
++            return false;
++        }
++        *slot = value;
++        true
++    }
++}
++
++fn unquote(value: &str) -> String {
++    value.trim().trim_matches('\'').to_owned()
++}
++
++fn gsettings_get(key: &str) -> Option<String> {
++    let output = Command::new("gsettings")
++        .args(["get", SCHEMA, key])
++        .stdin(Stdio::null())
++        .stderr(Stdio::null())
++        .output()
++        .ok()?;
++    output
++        .status
++        .success()
++        .then(|| unquote(&String::from_utf8_lossy(&output.stdout)))
++}
++
++/// Follows the desktop theme on a background thread.
++pub struct ThemeWatcher {
++    current: Arc<Mutex<Theme>>,
++    generation: Arc<AtomicU64>,
++}
++
++impl ThemeWatcher {
++    #[must_use]
++    pub fn start() -> Self {
++        let current = Arc::new(Mutex::new(Theme::DEFAULT));
++        let generation = Arc::new(AtomicU64::new(0));
++        let worker_current = Arc::clone(&current);
++        let worker_generation = Arc::clone(&generation);
++        thread::spawn(move || watch(&worker_current, &worker_generation));
++        Self {
++            current,
++            generation,
++        }
++    }
++
++    /// Returns the theme when it changed since `seen`, updating `seen`.
++    pub fn take_if_changed(&self, seen: &mut u64) -> Option<Theme> {
++        let generation = self.generation.load(Ordering::Acquire);
++        if generation == *seen {
++            return None;
++        }
++        *seen = generation;
++        self.current.lock().ok().map(|theme| *theme)
++    }
++}
++
++fn watch(current: &Mutex<Theme>, generation: &AtomicU64) {
++    let publish = |settings: &Settings| {
++        if let Ok(mut theme) = current.lock() {
++            *theme = settings.theme();
++        }
++        generation.fetch_add(1, Ordering::AcqRel);
++    };
++    loop {
++        let (Some(accent), Some(color_scheme)) =
++            (gsettings_get("accent-color"), gsettings_get("color-scheme"))
++        else {
++            thread::sleep(RESTART_DELAY);
++            continue;
++        };
++        let mut settings = Settings {
++            accent,
++            color_scheme,
++        };
++        publish(&settings);
++        if let Ok(mut child) = Command::new("gsettings")
++            .args(["monitor", SCHEMA])
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::null())
++            .spawn()
++        {
++            if let Some(stdout) = child.stdout.take() {
++                for line in BufReader::new(stdout).lines() {
++                    let Ok(line) = line else { break };
++                    if settings.apply_line(&line) {
++                        publish(&settings);
++                    }
++                }
++            }
++            let _ = child.kill();
++            let _ = child.wait();
++        }
++        thread::sleep(RESTART_DELAY);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn settings() -> Settings {
++        Settings {
++            accent: "blue".into(),
++            color_scheme: "prefer-dark".into(),
++        }
++    }
++
++    #[test]
++    fn monitor_lines_update_only_known_changed_keys() {
++        let mut s = settings();
++        assert!(!s.apply_line("accent-color: 'blue'"));
++        assert!(!s.apply_line("font-name: 'Cantarell 11'"));
++        assert!(!s.apply_line("garbage"));
++        assert!(s.apply_line("accent-color: 'teal'"));
++        assert_eq!(s.theme().accent, accent_rgb("teal").unwrap());
++        assert!(s.apply_line("color-scheme: 'prefer-light'"));
++        assert_eq!(s.theme().pressed_plate, s.theme().accent);
++        assert_ne!(s.theme().plate, settings().theme().plate);
++    }
++
++    #[test]
++    fn unknown_accent_and_default_scheme_fall_back_to_dark_blue() {
++        let s = Settings {
++            accent: "chartreuse".into(),
++            color_scheme: "default".into(),
++        };
++        assert_eq!(s.theme(), Theme::adwaita(true, Theme::DEFAULT.accent));
++    }
++}
+diff --git a/crates/t1-touchbar/src/tux.rs b/crates/t1-touchbar/src/tux.rs
+new file mode 100644
+index 0000000..dc80265
+--- /dev/null
++++ b/crates/t1-touchbar/src/tux.rs
+@@ -0,0 +1,171 @@
++//! Small procedural penguin mascot with an accent-colored scarf.
++
++use crate::framebuffer::{FramebufferError, Rectangle, Rgb, Xrgb8888Frame};
++
++/// Native drawing box, in pixels at the 60-pixel panel height.
++pub(crate) const NATIVE_WIDTH: u32 = 44;
++pub(crate) const NATIVE_HEIGHT: u32 = 54;
++const SAMPLE_GRID: u32 = 4;
++
++const BODY: Rgb = Rgb {
++    red: 78,
++    green: 78,
++    blue: 86,
++};
++const WHITE: Rgb = Rgb {
++    red: 244,
++    green: 244,
++    blue: 244,
++};
++const PUPIL: Rgb = Rgb {
++    red: 16,
++    green: 16,
++    blue: 18,
++};
++const ORANGE: Rgb = Rgb {
++    red: 246,
++    green: 166,
++    blue: 35,
++};
++
++/// One ellipse in native box coordinates: center, radii.
++#[derive(Clone, Copy)]
++struct Ellipse(f32, f32, f32, f32);
++
++/// Layers back to front.
++fn layers(accent: Rgb) -> [(Rgb, &'static [Ellipse]); 6] {
++    const BODY_SHAPES: &[Ellipse] = &[
++        Ellipse(22.0, 33.0, 15.0, 18.5), // body
++        Ellipse(22.0, 15.0, 11.5, 11.5), // head
++        Ellipse(8.5, 32.0, 4.0, 11.0),   // left flipper
++        Ellipse(35.5, 32.0, 4.0, 11.0),  // right flipper
++    ];
++    const WHITE_SHAPES: &[Ellipse] = &[
++        Ellipse(22.0, 36.0, 10.0, 14.0), // belly
++        Ellipse(18.0, 13.0, 3.6, 4.6),   // left eye
++        Ellipse(26.0, 13.0, 3.6, 4.6),   // right eye
++    ];
++    const PUPILS: &[Ellipse] = &[Ellipse(18.9, 14.0, 1.7, 2.2), Ellipse(25.1, 14.0, 1.7, 2.2)];
++    const BEAK: &[Ellipse] = &[Ellipse(22.0, 19.5, 5.0, 2.6)];
++    const SCARF: &[Ellipse] = &[Ellipse(22.0, 24.5, 12.5, 2.8), Ellipse(30.0, 29.0, 2.6, 5.0)];
++    const FEET: &[Ellipse] = &[Ellipse(14.5, 51.0, 7.0, 2.8), Ellipse(29.5, 51.0, 7.0, 2.8)];
++    [
++        (BODY, BODY_SHAPES),
++        (WHITE, WHITE_SHAPES),
++        (PUPIL, PUPILS),
++        (ORANGE, BEAK),
++        (accent, SCARF),
++        (ORANGE, FEET),
++    ]
++}
++
++/// Draws the penguin scaled into `bounds` (aspect kept, centered).
++pub(crate) fn draw(
++    frame: &mut Xrgb8888Frame<'_>,
++    bounds: Rectangle,
++    accent: Rgb,
++) -> Result<(), FramebufferError> {
++    #[allow(clippy::cast_precision_loss)]
++    let scale = (bounds.width as f32 / NATIVE_WIDTH as f32)
++        .min(bounds.height as f32 / NATIVE_HEIGHT as f32);
++    if scale <= 0.0 {
++        return Ok(());
++    }
++    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
++    let (width, height) = (
++        ((NATIVE_WIDTH as f32 * scale).ceil() as u32).min(bounds.width),
++        ((NATIVE_HEIGHT as f32 * scale).ceil() as u32).min(bounds.height),
++    );
++    let area = Rectangle {
++        x: bounds.x + (bounds.width - width) / 2,
++        y: bounds.y + (bounds.height - height) / 2,
++        width,
++        height,
++    };
++    for (color, shapes) in layers(accent) {
++        let mask = coverage(shapes, width, height, scale);
++        frame.blend_mask(area, &mask, color)?;
++    }
++    Ok(())
++}
++
++/// Silhouette used by the background pattern (body, head, flippers, feet).
++const SILHOUETTE: &[Ellipse] = &[
++    Ellipse(22.0, 33.0, 15.0, 18.5),
++    Ellipse(22.0, 15.0, 11.5, 11.5),
++    Ellipse(8.5, 32.0, 4.0, 11.0),
++    Ellipse(35.5, 32.0, 4.0, 11.0),
++    Ellipse(14.5, 51.0, 7.0, 2.8),
++    Ellipse(29.5, 51.0, 7.0, 2.8),
++];
++/// White penguin silhouette `height` pixels tall; alpha carries the shape.
++pub(crate) fn silhouette(height: u32) -> crate::png::Image {
++    #[allow(clippy::cast_precision_loss)]
++    let scale = height as f32 / NATIVE_HEIGHT as f32;
++    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
++    let width = ((NATIVE_WIDTH as f32 * scale).ceil() as u32).max(1);
++    let rgba = coverage(SILHOUETTE, width, height, scale)
++        .into_iter()
++        .flat_map(|alpha| [255, 255, 255, alpha])
++        .collect();
++    crate::png::Image {
++        width,
++        height,
++        rgba,
++    }
++}
++
++#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
++fn coverage(shapes: &[Ellipse], width: u32, height: u32, scale: f32) -> Vec<u8> {
++    let samples = SAMPLE_GRID * SAMPLE_GRID;
++    let mut mask = Vec::with_capacity((width * height) as usize);
++    for py in 0..height {
++        for px in 0..width {
++            let mut hits = 0;
++            for sy in 0..SAMPLE_GRID {
++                for sx in 0..SAMPLE_GRID {
++                    let x = (px as f32 + (sx as f32 + 0.5) / SAMPLE_GRID as f32) / scale;
++                    let y = (py as f32 + (sy as f32 + 0.5) / SAMPLE_GRID as f32) / scale;
++                    if shapes.iter().any(|&Ellipse(cx, cy, rx, ry)| {
++                        let (dx, dy) = ((x - cx) / rx, (y - cy) / ry);
++                        dx * dx + dy * dy <= 1.0
++                    }) {
++                        hits += 1;
++                    }
++                }
++            }
++            mask.push((hits * 255 / samples) as u8);
++        }
++    }
++    mask
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn penguin_fits_and_paints_inside_bounds_only() {
++        let (w, h) = (100u32, 60u32);
++        let mut pixels = vec![0u8; (w * h * 4) as usize];
++        let mut frame = Xrgb8888Frame::new(w, h, w * 4, &mut pixels).unwrap();
++        let bounds = Rectangle {
++            x: 30,
++            y: 0,
++            width: 50,
++            height: 60,
++        };
++        let accent = Rgb {
++            red: 53,
++            green: 132,
++            blue: 228,
++        };
++        draw(&mut frame, bounds, accent).unwrap();
++        let painted: Vec<u32> = (0..w * h)
++            .filter(|i| pixels[(*i * 4) as usize..(*i * 4 + 3) as usize] != [0, 0, 0])
++            .map(|i| i % w)
++            .collect();
++        assert!(!painted.is_empty());
++        assert!(painted.iter().all(|x| (30..80).contains(x)));
++    }
++}
+diff --git a/debian/README.md b/debian/README.md
+new file mode 100644
+index 0000000..9b4eb04
+--- /dev/null
++++ b/debian/README.md
+@@ -0,0 +1,21 @@
++# Debian 13 (6.12) šaka — Touch Bar MacBookPro14,2
++
++Vietinis t1bridge port'as Debian'ui, ne upstream'ui.
++
++Diegimas (po `t1-revive regenerate`, kai T1 jau `05ac:8600`):
++
++    cargo build --locked --release -p t1-touchbar-hw --bin t1-touchbar-hw --features service
++    cargo build --locked --release -p t1-touchbar --bin t1-touchbar
++    sudo debian/install-touchbar.sh      # DKMS, systemd, udev, provider'is, vartotojo konfigas
++    sudo reboot
++
++Atšaukti: `sudo debian/uninstall-touchbar.sh`.
++
++Kas čia pakeista, palyginti su upstream v0.1.12:
++- branduolio moduliai portuoti 6.12 (`uvcvideo` iš `linux-source-6.12` + H.264 pataisos);
++- ESC 64 pt kaip macOS; GNOME tema (akcentas, šviesi/tamsi) per `gsettings monitor`;
++- temos ir Fn veiksmai `~/.config/t1bridge/touchbar.conf` (`touchbar.conf.example`, `themes-README.txt`);
++- savas PNG dekoderis (`crates/t1-touchbar/src/png.rs`), be naujų priklausomybių;
++- ROOT: `TapKeys` dabar akordas, klavišų allowlist'as 101 klavišas (`wire::KeyCode::ALLOWED` = C `key_codes`);
++- `t1bridge-desktop-provider` — garso mygtukai (wpctl) ir MPRIS play/next (gdbus);
++- usbmuxd udev pataisa: Debian'o taisyklė išjungia T1 (`bConfigurationValue=0`).
+diff --git a/debian/install-touchbar.sh b/debian/install-touchbar.sh
+new file mode 100644
+index 0000000..d7a2b35
+--- /dev/null
++++ b/debian/install-touchbar.sh
+@@ -0,0 +1,83 @@
++#!/bin/bash
++# T1Bridge Touch Bar (+ T1 kamera) diegimas Debian 13 / branduolys 6.12.
++# Tik Touch Bar dalis: be Touch ID (fprintd/libfprint pakaitalų, keybag, xART paslaugų).
++# Paleisti iš šakos debian-6.12, po:
++#   cargo build --locked --release -p t1-touchbar-hw --bin t1-touchbar-hw --features service
++#   cargo build --locked --release -p t1-touchbar --bin t1-touchbar
++# Atšaukti: debian/uninstall-touchbar.sh
++set -euo pipefail
++
++[ "$(id -u)" = 0 ] || { echo "Paleisk per sudo" >&2; exit 1; }
++SRC=$(cd "$(dirname "$0")/.." && pwd)
++VER=0.1.12+deb612
++DKMS_DIR=/usr/src/t1bridge-dkms-$VER
++USER_NAME=${SUDO_USER:?paleisk per sudo iš savo paskyros}
++
++for b in t1-touchbar-hw t1-touchbar; do
++	[ -x "$SRC/target/release/$b" ] || { echo "Nėra $b — pirma cargo build" >&2; exit 1; }
++done
++
++echo "== 1. DKMS moduliai ($VER)"
++rm -rf "$DKMS_DIR"
++mkdir -p "$DKMS_DIR/kernel"
++for d in t1-cfgsel appletbdrm-t1 apple-t1-ncm uvcvideo-t1 dkms; do
++	mkdir -p "$DKMS_DIR/kernel/$d"
++	find "$SRC/kernel/$d" -maxdepth 1 -type f \( -name '*.c' -o -name '*.h' -o -name Makefile \) \
++		! -name 'test_*' ! -name '*.mod.c' -exec install -m644 {} "$DKMS_DIR/kernel/$d/" \;
++done
++sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$VER\"/" "$SRC/kernel/dkms/dkms.conf" > "$DKMS_DIR/dkms.conf"
++dkms add -m t1bridge-dkms -v "$VER"
++dkms install -m t1bridge-dkms -v "$VER" -k "$(uname -r)"
++
++echo "== 2. Modulių įkėlimas ir legacy draiverių blokavimas"
++install -Dm644 "$SRC/packaging/arch/t1bridge-dkms/t1bridge.modules-load.conf" /etc/modules-load.d/t1bridge.conf
++install -Dm644 "$SRC/packaging/arch/t1bridge-dkms/t1bridge.modprobe.conf" /etc/modprobe.d/t1bridge.conf
++# t1_cfgsel turi būti prieš iBridge enumeraciją -> į initramfs
++grep -qx t1_cfgsel /etc/initramfs-tools/modules || echo t1_cfgsel >> /etc/initramfs-tools/modules
++update-initramfs -u -k "$(uname -r)"
++
++echo "== 3. Programos"
++install -Dm755 "$SRC/target/release/t1-touchbar-hw" /usr/lib/t1bridge/t1-touchbar-hw
++install -Dm755 "$SRC/target/release/t1-touchbar" /usr/lib/t1bridge/t1-touchbar
++# Garsas (wpctl) ir grotuvas (MPRIS) — be jo Touch Bar slepia garso mygtukus
++install -Dm755 "$SRC/debian/t1bridge-desktop-provider" /usr/lib/t1bridge/desktop-provider
++install -d /etc/systemd/user/t1-touchbar.service.d
++printf '[Service]\nEnvironment=T1BRIDGE_DESKTOP_PROVIDER=/usr/lib/t1bridge/desktop-provider\n' \
++	> /etc/systemd/user/t1-touchbar.service.d/desktop-provider.conf
++
++echo "== 4. systemd / udev / sysusers / tmpfiles"
++install -Dm644 "$SRC/systemd/t1-touchbar-hw.service" /etc/systemd/system/t1-touchbar-hw.service
++install -Dm644 "$SRC/systemd/t1-touchbar-hw.socket" /etc/systemd/system/t1-touchbar-hw.socket
++install -Dm644 "$SRC/systemd/user/t1-touchbar.service" /etc/systemd/user/t1-touchbar.service
++install -Dm644 "$SRC/systemd/t1bridge.sysusers" /etc/sysusers.d/t1bridge.conf
++install -Dm644 "$SRC/systemd/t1bridge.conf" /etc/tmpfiles.d/t1bridge.conf
++install -Dm644 "$SRC/systemd/99-zz-t1bridge-touchbar.rules" /etc/udev/rules.d/99-zz-t1bridge-touchbar.rules
++systemd-sysusers /etc/sysusers.d/t1bridge.conf
++systemd-tmpfiles --create /etc/tmpfiles.d/t1bridge.conf
++usermod -aG t1bridge "$USER_NAME"
++systemctl daemon-reload
++udevadm control --reload
++systemctl enable t1-touchbar-hw.service
++systemctl --global enable t1-touchbar.service
++
++echo "== 5. usbmuxd udev pataisa (be jos T1 pakyla su bConfigurationValue=0 -> nėra kameros/Touch Bar)"
++if [ -f /usr/lib/udev/rules.d/39-usbmuxd.rules ]; then
++	{
++		echo "# LOCAL OVERRIDE (t1bridge debian): pašalintas 5ac/8600 (MacBookPro T1 iBridge)."
++		echo "# Originali taisyklė jam nustato bConfigurationValue=0 -> dingsta kamera ir Touch Bar."
++		sed 's#|5ac/8600/\*##' /usr/lib/udev/rules.d/39-usbmuxd.rules
++	} > /etc/udev/rules.d/39-usbmuxd.rules
++	udevadm control --reload
++fi
++
++echo "== 6. Vartotojo konfigas (jei dar nėra)"
++USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
++CONF_DIR="$USER_HOME/.config/t1bridge"
++if [ ! -e "$CONF_DIR/touchbar.conf" ]; then
++	install -d -o "$USER_NAME" -g "$USER_NAME" "$CONF_DIR" "$CONF_DIR/themes" "$CONF_DIR/icons"
++	install -m644 -o "$USER_NAME" -g "$USER_NAME" "$SRC/debian/touchbar.conf.example" "$CONF_DIR/touchbar.conf"
++	install -m644 -o "$USER_NAME" -g "$USER_NAME" "$SRC/debian/themes-README.txt" "$CONF_DIR/themes/README.txt"
++fi
++
++echo "== Baigta. Perkrauk. Po to: lsusb -t (T1 config 2), ls /dev/dri/touchbar /dev/video*,"
++echo "   systemctl status t1-touchbar-hw; systemctl --user status t1-touchbar"
+diff --git a/debian/t1bridge-desktop-provider b/debian/t1bridge-desktop-provider
+new file mode 100755
+index 0000000..24788d9
+--- /dev/null
++++ b/debian/t1bridge-desktop-provider
+@@ -0,0 +1,46 @@
++#!/bin/bash
++# T1Bridge desktop provider v1 (docs/interfaces.md "Desktop provider v1").
++# Garsas per wpctl (PipeWire), grotuvas per MPRIS (gdbus). Be root'o.
++set -u
++SINK=@DEFAULT_AUDIO_SINK@
++
++[ "${1:-}" = v1 ] || exit 2
++op=${2:-}
++
++mpris_player() {
++	gdbus call --session --timeout 1 --dest org.freedesktop.DBus \
++		--object-path /org/freedesktop/DBus --method org.freedesktop.DBus.ListNames 2>/dev/null |
++		grep -o "org\.mpris\.MediaPlayer2\.[^']*" | head -n1
++}
++
++mpris() {
++	local p
++	p=$(mpris_player) || exit 1
++	[ -n "$p" ] || exit 1
++	gdbus call --session --timeout 1 --dest "$p" --object-path /org/mpris/MediaPlayer2 \
++		--method "org.mpris.MediaPlayer2.Player.$1" >/dev/null
++}
++
++case "$op" in
++status)
++	caps=0 vol=- muted=-
++	if out=$(wpctl get-volume "$SINK" 2>/dev/null); then
++		caps=1
++		v=$(awk '{print $2}' <<<"$out")
++		vol=$(awk -v v="$v" 'BEGIN { x = int(v * 100 + 0.5); if (x > 100) x = 100; print x }')
++		[[ $out == *MUTED* ]] && muted=1 || muted=0
++	fi
++	[ -n "$(mpris_player)" ] && caps=$((caps | 2))
++	echo "T1BRIDGE-DESKTOP 1 $caps $vol $muted"
++	;;
++set-volume)
++	[[ ${3:-} =~ ^([0-9]|[1-9][0-9]|100)$ ]] || exit 2
++	wpctl set-volume "$SINK" "$3%"
++	;;
++toggle-mute) wpctl set-mute "$SINK" toggle ;;
++media-previous) mpris Previous ;;
++media-play-pause) mpris PlayPause ;;
++media-next) mpris Next ;;
++show-display-brightness | show-keyboard-backlight | notify-renderer-fallback) exit 0 ;;
++*) exit 2 ;;
++esac
+diff --git a/debian/themes-README.txt b/debian/themes-README.txt
+new file mode 100644
+index 0000000..796514f
+--- /dev/null
++++ b/debian/themes-README.txt
+@@ -0,0 +1,17 @@
++Savo tema: sukurk katalogą themes/<vardas>/ su theme.conf ir PNG failais,
++tada touchbar.conf įrašyk: theme = <vardas>
++
++theme.conf (visi nustatymai neprivalomi):
++  style = gnome            # gnome (seka sistemą) | dark | light
++  accent = gnome           # gnome | #rrggbb
++  background = fonas.png   # visos juostos paveikslėlis (juosta 2170x60, tinka 1085x30 ir pan.)
++  background.opacity = 100 # %
++  buttons.opacity = 100    # % - mažiau = fonas matosi pro mygtukus
++  watermark = penguin      # none | penguin | failas.png - kiekvieno mygtuko fone
++  watermark.scale = 0.9    # x mygtuko aukštis; >1 = didesnis, apkerpamas
++  watermark.opacity = 13   # %
++  watermark.x = 0          # poslinkis pikseliais
++  watermark.y = 0
++  mascot = tux             # none | tux | failas.png - tarpe po ESC
++
++PNG: 8 bitų, ne interlaced (taip saugo GIMP/Inkscape pagal nutylėjimą).
+diff --git a/debian/touchbar.conf.example b/debian/touchbar.conf.example
+new file mode 100644
+index 0000000..c45c3c7
+--- /dev/null
++++ b/debian/touchbar.conf.example
+@@ -0,0 +1,19 @@
++# T1Bridge Touch Bar nustatymai. Pakeitimai įsigalioja per ~1 s, perkrauti nereikia.
++# Klaidos matomos: journalctl --user -u t1-touchbar
++
++# Tema: default (švarūs mygtukai) | penguin | katalogas themes/<vardas>/
++theme = default
++
++# Fn + F1..F12 veiksmai (be priskyrimo F klavišas veikia kaip įprastai):
++#   keys a+b+c   - iki 4 klavišų kartu, pvz. ctrl+alt+t, super+e, ctrl+shift+esc
++#   exec komanda - paleidžiama per sh -c kaip tu
++#   .icon        - PNG ikonėlė vietoj užrašo "F1" (kelias santykinis šiam katalogui)
++#
++# Klavišų vardai: ctrl shift alt altgr super, a-z, 0-9, esc tab enter space backspace
++#   delete insert home end pageup pagedown up down left right print, f1-f24,
++#   minus equal leftbrace rightbrace semicolon apostrophe grave backslash comma dot slash,
++#   mute volumedown volumeup playpause next previous
++#
++#fn.f1 = keys super+e
++#fn.f2 = exec gnome-terminal
++#fn.f2.icon = icons/terminal.png
+diff --git a/debian/uninstall-touchbar.sh b/debian/uninstall-touchbar.sh
+new file mode 100644
+index 0000000..accf596
+--- /dev/null
++++ b/debian/uninstall-touchbar.sh
+@@ -0,0 +1,21 @@
++#!/bin/bash
++# Atšaukia install-touchbar.sh. Po to perkrauti — T1 grįš į config 1 su stock uvcvideo.
++set -uo pipefail
++[ "$(id -u)" = 0 ] || { echo "Paleisk per sudo" >&2; exit 1; }
++VER=0.1.12+deb612
++
++systemctl --global disable t1-touchbar.service
++systemctl disable --now t1-touchbar-hw.service t1-touchbar-hw.socket
++rm -f /etc/systemd/system/t1-touchbar-hw.{service,socket} /etc/systemd/user/t1-touchbar.service \
++      /etc/udev/rules.d/99-zz-t1bridge-touchbar.rules /etc/sysusers.d/t1bridge.conf \
++      /etc/tmpfiles.d/t1bridge.conf /etc/modules-load.d/t1bridge.conf /etc/modprobe.d/t1bridge.conf
++rm -rf /usr/lib/t1bridge
++rm -rf /etc/systemd/user/t1-touchbar.service.d
++rm -f /etc/udev/rules.d/39-usbmuxd.rules  # grąžina Debian'o usbmuxd taisyklę
++sed -i '/^t1_cfgsel$/d' /etc/initramfs-tools/modules
++dkms remove -m t1bridge-dkms -v "$VER" --all
++rm -rf "/usr/src/t1bridge-dkms-$VER"
++update-initramfs -u -k "$(uname -r)"
++systemctl daemon-reload
++udevadm control --reload
++echo "Pašalinta. Grupė t1bridge palikta (nekenksminga): groupdel t1bridge"
+-- 
+2.47.3
+

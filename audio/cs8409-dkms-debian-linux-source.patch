@@ -1,0 +1,75 @@
+diff --git a/dkms.conf b/dkms.conf
+index 52c684e..1e35bcc 100644
+--- a/dkms.conf
++++ b/dkms.conf
+@@ -1,6 +1,6 @@
+ PACKAGE_NAME="snd_hda_macbookpro"
+ PACKAGE_VERSION="0.1"
+-PRE_BUILD="install.cirrus.driver.sh -k $kernelver --dkms"
++PRE_BUILD="install.cirrus.driver.pre617.sh -k $kernelver --dkms"
+ MAKE="make"
+ BUILT_MODULE_NAME[0]="snd-hda-codec-cs8409"
+ BUILT_MODULE_LOCATION[0]="build/hda"
+diff --git a/install.cirrus.driver.pre617.sh b/install.cirrus.driver.pre617.sh
+index 1664ddf..997cb9d 100755
+--- a/install.cirrus.driver.pre617.sh
++++ b/install.cirrus.driver.pre617.sh
+@@ -198,6 +198,58 @@ if [ $isubuntu -ge 1 ]; then
+ 
+ 	tar --strip-components=3 -xvf /usr/src/linux-source-$kernel_version.tar.bz2 --directory=build/ linux-source-$kernel_version/sound/pci/hda
+ 
++elif [ -e /usr/src/linux-source-$major_version.$minor_version.tar.xz ]; then
++
++	# NOTE for Debian the linux-source-x.x package matches the running kernel point release exactly
++	# (the mainline linux-x.x.x tarball for a Debian kernel does not exist on kernel.org, and the
++	#  fallback to the linux-x.x base tarball builds against the wrong sources - the resulting
++	#  module then oopses at runtime against the running kernel's hda_generic)
++
++	# The package name only carries x.y, so a kernel point release upgrade keeps the same
++	# tarball path while its contents may still be the OLD point release - eg during an apt
++	# run that configures linux-image (and triggers dkms) before unpacking the new
++	# linux-source. Building against that mismatch is exactly the case that oopses in
++	# call_update_outputs, so refuse to build rather than install a broken module.
++
++	src_pkg_ver=$(dpkg-query -W -f='${Version}' linux-source-$major_version.$minor_version 2>/dev/null | sed 's/[-+].*//')
++	run_ver=$(echo $UNAME | sed 's/[-+].*//')
++
++	if [ -n "$src_pkg_ver" ] && [ "$src_pkg_ver" != "$run_ver" ]; then
++
++		echo "REFUSING TO BUILD: kernel source version does not match the target kernel"
++		echo "  target kernel     : $UNAME  (point release $run_ver)"
++		echo "  linux-source-$major_version.$minor_version : $src_pkg_ver"
++		echo ""
++		echo "Building against mismatched sound/pci/hda headers produces a module that"
++		echo "loads and then oopses in call_update_outputs. Fix the source package first:"
++		echo "  sudo apt install --reinstall linux-source-$major_version.$minor_version"
++		echo "then rebuild:"
++		echo "  sudo dkms install snd_hda_macbookpro/0.1 -k $UNAME"
++		echo ""
++		echo "Until then boot the previous kernel from GRUB > Advanced options."
++
++		exit 1
++
++	fi
++
++	tar --strip-components=3 -xvf /usr/src/linux-source-$major_version.$minor_version.tar.xz --directory=build/ linux-source-$major_version.$minor_version/sound/pci/hda
++
++elif [ $(grep -c '^ID=debian' /etc/os-release) -eq 1 ]; then
++
++	# Debian without a matching linux-source package. The kernel.org fallback below would
++	# grab vanilla sources and silently build a module that oopses (see note above), so stop
++	# here instead - eg after a jump to a new kernel series where linux-source-x.y changed name.
++
++	echo "REFUSING TO BUILD: /usr/src/linux-source-$major_version.$minor_version.tar.xz not found on Debian"
++	echo ""
++	echo "The kernel.org fallback builds against vanilla sources, which do not match a"
++	echo "Debian kernel and oops at runtime. Install the matching source package:"
++	echo "  sudo apt install linux-source-$major_version.$minor_version"
++	echo "then rebuild:"
++	echo "  sudo dkms install snd_hda_macbookpro/0.1 -k $UNAME"
++
++	exit 1
++
+ else
+ 	# here we assume the distribution kernel source is essentially the mainline kernel source
+ 

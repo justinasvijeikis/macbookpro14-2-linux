@@ -1,0 +1,29 @@
+From 1b9962a684f1f7531caa9a332502778f210a4c1f Mon Sep 17 00:00:00 2001
+From: justinasvijeikis <80092258+justinasvijeikis@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:30:25 +0200
+Subject: [PATCH] debian: keep NM_UNMANAGED across the NCM interface rename
+
+The rule matched only ACTION==add. The link is renamed right after
+(enx...), the move event re-runs the rules and the properties set on
+add are dropped, so NetworkManager still ran DHCP every 45 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ debian/90-t1bridge-ncm-unmanaged.rules | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/debian/90-t1bridge-ncm-unmanaged.rules b/debian/90-t1bridge-ncm-unmanaged.rules
+index 539848c..c71e8d9 100644
+--- a/debian/90-t1bridge-ncm-unmanaged.rules
++++ b/debian/90-t1bridge-ncm-unmanaged.rules
+@@ -1,6 +1,6 @@
+ # Upstream 90-t1bridge-xart.rules be Touch ID dalies (t1-xart-storage):
+ # privačios T1 NCM sąsajos neliečia NetworkManager / kiti tinklo valdytojai.
+ # Be šito NM kas ~45 s bando DHCP ir GNOME rodo "Activation of network connection failed".
+-ACTION=="add", SUBSYSTEM=="net", ENV{ID_VENDOR_ID}=="05ac", \
++ACTION!="remove", SUBSYSTEM=="net", ENV{ID_VENDOR_ID}=="05ac", \
+   ENV{ID_MODEL_ID}=="8600", ENV{ID_USB_INTERFACE_NUM}=="04", \
+   ENV{ID_NET_MANAGED_BY}="org.t1bridge", ENV{NM_UNMANAGED}="1", ENV{ID_MM_DEVICE_IGNORE}="1"
+-- 
+2.47.3
+

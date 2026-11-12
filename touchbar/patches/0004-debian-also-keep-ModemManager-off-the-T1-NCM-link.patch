@@ -1,0 +1,23 @@
+From edd3b350680db9d51224c5a4482ca3e0ab48f3bc Mon Sep 17 00:00:00 2001
+From: justinasvijeikis <80092258+justinasvijeikis@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:13:31 +0200
+Subject: [PATCH 4/4] debian: also keep ModemManager off the T1 NCM link
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ debian/90-t1bridge-ncm-unmanaged.rules | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/debian/90-t1bridge-ncm-unmanaged.rules b/debian/90-t1bridge-ncm-unmanaged.rules
+index dd1c431..539848c 100644
+--- a/debian/90-t1bridge-ncm-unmanaged.rules
++++ b/debian/90-t1bridge-ncm-unmanaged.rules
+@@ -3,4 +3,4 @@
+ # Be šito NM kas ~45 s bando DHCP ir GNOME rodo "Activation of network connection failed".
+ ACTION=="add", SUBSYSTEM=="net", ENV{ID_VENDOR_ID}=="05ac", \
+   ENV{ID_MODEL_ID}=="8600", ENV{ID_USB_INTERFACE_NUM}=="04", \
+-  ENV{ID_NET_MANAGED_BY}="org.t1bridge", ENV{NM_UNMANAGED}="1"
++  ENV{ID_NET_MANAGED_BY}="org.t1bridge", ENV{NM_UNMANAGED}="1", ENV{ID_MM_DEVICE_IGNORE}="1"
+-- 
+2.47.3
+

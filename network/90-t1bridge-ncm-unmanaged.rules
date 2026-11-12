@@ -1,0 +1,6 @@
+# Upstream 90-t1bridge-xart.rules be Touch ID dalies (t1-xart-storage):
+# privačios T1 NCM sąsajos neliečia NetworkManager / kiti tinklo valdytojai.
+# Be šito NM kas ~45 s bando DHCP ir GNOME rodo "Activation of network connection failed".
+ACTION!="remove", SUBSYSTEM=="net", ENV{ID_VENDOR_ID}=="05ac", \
+  ENV{ID_MODEL_ID}=="8600", ENV{ID_USB_INTERFACE_NUM}=="04", \
+  ENV{ID_NET_MANAGED_BY}="org.t1bridge", ENV{NM_UNMANAGED}="1", ENV{ID_MM_DEVICE_IGNORE}="1"
